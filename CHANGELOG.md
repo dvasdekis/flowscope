@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-11
+
 ### Added
 
 #### Web App (app/) — Librarian (2026-05-04)
@@ -16,6 +18,12 @@ AI chat panel for asking questions about your data using SQL lineage and uploade
 Answers follow a structured **Summary / Data Lineage / Documentation** format. Schema identifiers are highlighted inline in assistant responses (case-insensitive, normalized to canonical schema casing). Clicking an assistant message reads the answer's Summary, highlights every referenced table and column in the Lineage view via the existing search pipeline (auto-enabling "show column edges" when a column is referenced), and gently pans + pulses on the source table containing the column.
 
 Schema view gains a search control (table-name or column-name substring, Prev/Next cycling). Librarian toggle lives in the analysis toolbar next to Schema (⌘L / Ctrl+L); a help popover in the panel header describes the assistant and usage.
+
+### Fixed
+
+#### Core Engine (flowscope-core)
+- **Snowflake dbt column identities** ([#47](https://github.com/pondpilot/flowscope/pull/47)) — normalized producer and downstream `ref()` column identities so views no longer show duplicate uppercase and lowercase columns, while preserving case-sensitive dialect behavior and producer expression metadata for consumer-first analysis
+- **Nested-scope IntelliSense alias resolution** ([#46](https://github.com/pondpilot/flowscope/pull/46)) — resolved qualified aliases against the innermost `SELECT` scope, retained correlated outer aliases, handled whitespace after a qualifier dot, and kept BigQuery `SELECT * EXCEPT (...)` modifiers distinct from set operations
 
 ## [0.7.0] - 2026-04-23
 
