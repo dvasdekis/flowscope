@@ -1,17 +1,26 @@
-import { useState, useCallback, useEffect, useRef, startTransition } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef, startTransition } from 'react';
+import type { AnalyzeResult } from '@pondpilot/flowscope-core';
 import { useLineage } from '@pondpilot/flowscope-react';
 import { analyzeWithWorker, getCachedAnalysis, syncAnalysisFiles } from '@/lib/analysis-worker';
 import type { BackendAdapter, AnalysisPayload } from '@/lib/backend-adapter';
 import { useProject } from '@/lib/project-store';
 import type { Project } from '@/lib/project-store';
-import { useAnalysisStore } from '@/lib/analysis-store';
+import {
+  getAnalysisCacheRestoreDecision,
+  useAnalysisStore,
+  type AnalysisCacheIdentity,
+} from '@/lib/analysis-store';
+import { buildAnalysisCacheKey } from '@/lib/analysis-hash';
+import { canBuildProactiveAnalysisCacheKey } from '@/lib/analysis-cache-policy';
 import { useViewStateStore, getIssuesStateWithDefaults } from '@/lib/view-state-store';
 import { FILE_LIMITS, ANALYSIS_SQL_PREVIEW_LIMITS } from '@/lib/constants';
 import { AnalysisErrorCode, isAnalysisError } from '@/types';
 import type { AnalysisState, AnalysisContext, FileValidationResult } from '@/types';
+import { useDebounce } from './useDebounce';
 
 // Maximum retry attempts for file sync errors to prevent infinite loops
 const MAX_FILE_SYNC_RETRIES = 1;
+const ANALYSIS_CACHE_KEY_DEBOUNCE_MS = 300;
 
 // Debug flag for analysis-related logging - only enabled in development
 const ANALYSIS_DEBUG = !!(import.meta as { env?: { DEV?: boolean } }).env?.DEV;
@@ -40,10 +49,10 @@ export interface UseAnalysisOptions {
  */
 export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions) {
   const adapter = options?.adapter;
-  const { currentProject, activeProjectId } = useProject();
+  const { currentProject, activeProjectId, backendSchema } = useProject();
   const { actions, state: lineageState } = useLineage();
   const { hideCTEs } = lineageState;
-  const { getResult, getMetrics, setResult: storeResult, setMetrics } = useAnalysisStore();
+  const { getResult, setResult: storeResult, setMetrics } = useAnalysisStore();
   const getViewState = useViewStateStore((s) => s.getViewState);
   const enableLinting = activeProjectId
     ? getIssuesStateWithDefaults(getViewState(activeProjectId, 'issues')).showLintIssues
@@ -54,11 +63,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
     lastAnalyzedAt: null,
   });
   const analysisRequestRef = useRef(0);
-  const currentProjectRef = useRef<Project | null>(currentProject);
-
-  useEffect(() => {
-    currentProjectRef.current = currentProject;
-  }, [currentProject]);
+  const attemptedCacheIdentityRef = useRef<AnalysisCacheIdentity | null>(null);
 
   // Use ref for actions to avoid dependency issues (actions object changes every render)
   const actionsRef = useRef(actions);
@@ -144,6 +149,84 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
     []
   );
 
+  const buildAnalysisPayload = useCallback(
+    (project: Project | null, activeFileContent?: string, activeFilePath?: string) => {
+      const context = buildAnalysisContext(project, activeFileContent, activeFilePath);
+      if (!project || !context) {
+        return null;
+      }
+
+      const payload: AnalysisPayload = {
+        files: context.files,
+        dialect: project.dialect,
+        schemaSQL: project.schemaSQL ?? '',
+        hideCTEs,
+        enableColumnLineage: true,
+        enableLinting,
+        templateMode: project.templateMode,
+      };
+
+      return {
+        context,
+        payload,
+      };
+    },
+    [buildAnalysisContext, enableLinting, hideCTEs]
+  );
+
+  const canUseMemoryCache = !adapter || adapter.type === 'wasm';
+  // The canonical hash scans every file character. Skip it for REST (which cannot
+  // reuse memory results), debounce it for interactive WASM project changes, and
+  // keep proactive hashing bounded. Explicit analysis runs still build exact keys.
+  const currentAnalysisPayload = useMemo(() => {
+    if (!canUseMemoryCache || !activeProjectId) {
+      return null;
+    }
+
+    const activeFile = currentProject?.files.find(
+      (file) => file.id === currentProject.activeFileId
+    );
+    const analysisPayload = buildAnalysisPayload(
+      currentProject,
+      activeFile?.content,
+      activeFile?.path
+    );
+    if (!analysisPayload || !canBuildProactiveAnalysisCacheKey(analysisPayload.payload)) {
+      return null;
+    }
+
+    return { ...analysisPayload, projectId: activeProjectId };
+  }, [activeProjectId, buildAnalysisPayload, canUseMemoryCache, currentProject]);
+  const debouncedAnalysisPayload = useDebounce(
+    currentAnalysisPayload,
+    ANALYSIS_CACHE_KEY_DEBOUNCE_MS
+  );
+  const proactiveCacheInputIsSettled = currentAnalysisPayload === debouncedAnalysisPayload;
+  const currentAnalysisInput = useMemo(() => {
+    if (
+      !canUseMemoryCache ||
+      !debouncedAnalysisPayload ||
+      debouncedAnalysisPayload.projectId !== activeProjectId
+    ) {
+      return null;
+    }
+
+    return {
+      context: debouncedAnalysisPayload.context,
+      payload: debouncedAnalysisPayload.payload,
+      cacheKey: buildAnalysisCacheKey(debouncedAnalysisPayload.payload),
+    };
+  }, [activeProjectId, canUseMemoryCache, debouncedAnalysisPayload]);
+  const currentAnalysisCacheKey = currentAnalysisInput?.cacheKey ?? null;
+
+  // The REST server owns additional schema/template configuration that is not
+  // fully represented by AnalysisPayload. Never reuse its results in memory;
+  // this identity only clears the displayed result when the visible schema changes.
+  const backendSchemaIdentity = useMemo(
+    () => (adapter?.type === 'rest' ? JSON.stringify(backendSchema) : null),
+    [adapter?.type, backendSchema]
+  );
+
   useEffect(() => {
     if (!backendReady || !currentProject) {
       return;
@@ -181,9 +264,10 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
     };
   }, [currentProject, backendReady, adapter]);
 
-  // Restore cached analysis result from memory when project or hideCTEs changes.
-  // Cache validation is built into getResult - it returns null if the cached
-  // result was computed with a different hideCTEs setting.
+  // Restore a result only when switching to a project whose canonical analysis
+  // key matches. Input changes within the active project may keep the current
+  // graph visible for the staleness UI, but that result is never restored or
+  // sent to the worker as a known cache hit under a different key.
   useEffect(() => {
     if (ANALYSIS_DEBUG)
       console.log(
@@ -191,26 +275,55 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
       );
     const memoryCacheStart = nowMs();
 
-    if (!activeProjectId) {
+    if (!activeProjectId || !canUseMemoryCache) {
+      attemptedCacheIdentityRef.current = null;
       actionsRef.current.setResult(null);
       return;
     }
 
-    const cachedResult = getResult(activeProjectId, hideCTEs);
+    if (!currentAnalysisCacheKey) {
+      if (attemptedCacheIdentityRef.current?.projectId !== activeProjectId) {
+        actionsRef.current.setResult(null);
+        attemptedCacheIdentityRef.current = { projectId: activeProjectId, cacheKey: null };
+      }
+      return;
+    }
+
+    const cachedResult = getResult(activeProjectId, currentAnalysisCacheKey);
+    const nextIdentity = { projectId: activeProjectId, cacheKey: currentAnalysisCacheKey };
+    const restoreDecision = getAnalysisCacheRestoreDecision(
+      attemptedCacheIdentityRef.current,
+      nextIdentity,
+      cachedResult
+    );
+    attemptedCacheIdentityRef.current = nextIdentity;
     if (ANALYSIS_DEBUG)
       console.log(
         `[useAnalysis] Memory cache ${cachedResult ? 'HIT' : 'MISS'} (${(nowMs() - memoryCacheStart).toFixed(1)}ms)`
       );
+    if (!restoreDecision.shouldSetResult) {
+      return;
+    }
     // Use startTransition to make the result update low-priority,
     // allowing UI interactions and worker callbacks to proceed without blocking
     startTransition(() => {
-      actionsRef.current.setResult(cachedResult);
+      actionsRef.current.setResult(restoreDecision.result);
+      if (restoreDecision.result && currentAnalysisInput) {
+        actionsRef.current.setAnalyzedContent(
+          new Map(currentAnalysisInput.context.files.map((file) => [file.name, file.content]))
+        );
+        actionsRef.current.setStalePaths([]);
+      }
     });
-
-    if (cachedResult || !backendReady) {
-      return;
-    }
-  }, [activeProjectId, hideCTEs, getResult, backendReady]);
+  }, [
+    activeProjectId,
+    backendReady,
+    backendSchemaIdentity,
+    canUseMemoryCache,
+    currentAnalysisCacheKey,
+    currentAnalysisInput,
+    getResult,
+  ]);
 
   // Check worker's IndexedDB cache for persisted analysis results.
   // This runs after the memory cache effect and may update the result
@@ -221,24 +334,25 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
         `[useAnalysis] IndexedDB cache effect triggered (projectId: ${activeProjectId?.slice(0, 8) ?? 'null'})`
       );
 
-    if (!backendReady || !activeProjectId) {
+    if (
+      !backendReady ||
+      !activeProjectId ||
+      !currentAnalysisInput ||
+      !proactiveCacheInputIsSettled
+    ) {
       return;
     }
 
-    const cachedResult = getResult(activeProjectId, hideCTEs);
+    const cachedResult = canUseMemoryCache
+      ? getResult(activeProjectId, currentAnalysisInput.cacheKey)
+      : null;
     if (cachedResult) {
       if (ANALYSIS_DEBUG) console.log('[useAnalysis] IndexedDB cache skipped (memory cache hit)');
       return;
     }
 
-    const project = currentProjectRef.current;
-    if (!project) {
-      return;
-    }
-
-    const activeFile = project.files.find((file) => file.id === project.activeFileId);
-    const context = buildAnalysisContext(project, activeFile?.content, activeFile?.path);
-    if (!context || context.files.length === 0) {
+    const { context, payload: cachePayload, cacheKey } = currentAnalysisInput;
+    if (context.files.length === 0) {
       return;
     }
 
@@ -246,16 +360,6 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
     const cacheStart = nowMs();
     if (ANALYSIS_DEBUG)
       console.log(`[useAnalysis] Checking IndexedDB cache for ${context.files.length} files`);
-
-    const cachePayload: AnalysisPayload = {
-      files: context.files,
-      dialect: project.dialect,
-      schemaSQL: project.schemaSQL ?? '',
-      hideCTEs,
-      enableColumnLineage: true,
-      enableLinting,
-      templateMode: project.templateMode,
-    };
 
     const syncAndGetCache = adapter
       ? adapter.syncFiles(context.files).then(() => {
@@ -267,12 +371,12 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
             console.log(`[useAnalysis] Files synced, checking IndexedDB cache...`);
           return getCachedAnalysis({
             fileNames: context.files.map((file) => file.name),
-            dialect: project.dialect,
-            schemaSQL: project.schemaSQL ?? '',
-            hideCTEs,
-            enableColumnLineage: true,
-            enableLinting,
-            templateMode: project.templateMode,
+            dialect: cachePayload.dialect,
+            schemaSQL: cachePayload.schemaSQL,
+            hideCTEs: cachePayload.hideCTEs,
+            enableColumnLineage: cachePayload.enableColumnLineage,
+            enableLinting: cachePayload.enableLinting,
+            templateMode: cachePayload.templateMode,
           });
         });
 
@@ -284,7 +388,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
             console.log(`[useAnalysis] IndexedDB cache cancelled after ${durationMs.toFixed(1)}ms`);
           return;
         }
-        if (!cached?.result) {
+        if (!cached?.result || cached.cacheKey !== cacheKey) {
           if (ANALYSIS_DEBUG)
             console.log(`[useAnalysis] IndexedDB cache MISS after ${durationMs.toFixed(1)}ms`);
           return;
@@ -305,7 +409,9 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
           );
           actionsRef.current.setStalePaths([]);
         });
-        storeResult(activeProjectId, cached.result, hideCTEs);
+        if (canUseMemoryCache) {
+          storeResult(activeProjectId, cacheKey, cached.result);
+        }
         setMetrics(activeProjectId, {
           lastDurationMs: durationMs,
           lastCacheHit: true,
@@ -325,13 +431,13 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
     };
   }, [
     activeProjectId,
-    hideCTEs,
-    enableLinting,
+    canUseMemoryCache,
+    currentAnalysisInput,
+    proactiveCacheInputIsSettled,
     getResult,
     storeResult,
     setMetrics,
     backendReady,
-    buildAnalysisContext,
     adapter,
   ]);
 
@@ -349,12 +455,18 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 
       try {
-        const context = buildAnalysisContext(currentProject, activeFileContent, activeFilePath);
+        const analysisInput = buildAnalysisPayload(
+          currentProject,
+          activeFileContent,
+          activeFilePath
+        );
 
-        if (!context) {
+        if (!analysisInput) {
           setError('No project context available');
           return;
         }
+
+        const { context, payload: adapterPayload } = analysisInput;
 
         if (context.files.length === 0) {
           if (currentProject.runMode === 'custom') {
@@ -373,6 +485,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
           setError(validation.error || 'Validation failed');
           return;
         }
+        const cacheKey = canUseMemoryCache ? buildAnalysisCacheKey(adapterPayload) : null;
 
         console.log(context.description);
 
@@ -393,21 +506,24 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
           actionsRef.current.setSql(activeFileContent);
         }
 
-        const adapterPayload: AnalysisPayload = {
-          files: context.files,
-          dialect: currentProject.dialect,
-          schemaSQL: currentProject.schemaSQL ?? '',
-          hideCTEs,
-          enableColumnLineage: true,
-          enableLinting,
-          templateMode: currentProject.templateMode,
+        const cachedResult =
+          activeProjectId && cacheKey ? getResult(activeProjectId, cacheKey) : null;
+        const knownCacheKey = cachedResult ? cacheKey : null;
+        const displayResult = (result: AnalyzeResult) => {
+          startTransition(() => {
+            actionsRef.current.setResult(result);
+            actionsRef.current.setAnalyzedContent(
+              new Map(context.files.map((file) => [file.name, file.content]))
+            );
+            actionsRef.current.setStalePaths([]);
+          });
         };
 
-        const cachedResult = activeProjectId ? getResult(activeProjectId, hideCTEs) : null;
-        const knownCacheKey =
-          cachedResult && activeProjectId
-            ? (getMetrics(activeProjectId)?.lastCacheKey ?? null)
-            : null;
+        // A known key asks the worker to omit its result payload, so install the
+        // exact memory hit before allowing that response optimization.
+        if (cachedResult) {
+          displayResult(cachedResult);
+        }
 
         let analysisResponse: Awaited<ReturnType<typeof analyzeWithWorker>>;
         let fileSyncRetries = 0;
@@ -434,12 +550,12 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
           // Fallback to direct worker calls for backwards compatibility
           const workerPayload = {
             fileNames: context.files.map((file) => file.name),
-            dialect: currentProject.dialect,
-            schemaSQL: currentProject.schemaSQL ?? '',
-            hideCTEs,
-            enableColumnLineage: true,
-            enableLinting,
-            templateMode: currentProject.templateMode,
+            dialect: adapterPayload.dialect,
+            schemaSQL: adapterPayload.schemaSQL,
+            hideCTEs: adapterPayload.hideCTEs,
+            enableColumnLineage: adapterPayload.enableColumnLineage,
+            enableLinting: adapterPayload.enableLinting,
+            templateMode: adapterPayload.templateMode,
           };
 
           while (true) {
@@ -470,20 +586,15 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
         const durationMs = performance.now() - analysisStart;
 
         if (!analysisResponse.skipped && analysisResponse.result) {
-          // Use startTransition to make the result update low-priority,
-          // allowing UI interactions and worker callbacks to proceed without blocking
-          startTransition(() => {
-            actionsRef.current.setResult(analysisResponse.result);
-            // Snapshot the exact content that was just analyzed so the
-            // staleness gate (#22) has a baseline to diff future edits
-            // against. Keyed by the same path the analyzer keys statements by.
-            actionsRef.current.setAnalyzedContent(
-              new Map(context.files.map((f) => [f.name, f.content]))
-            );
-            actionsRef.current.setStalePaths([]);
-          });
-          if (activeProjectId) {
-            storeResult(activeProjectId, analysisResponse.result, hideCTEs);
+          if (cacheKey && analysisResponse.cacheKey !== cacheKey) {
+            throw new Error('Analysis response cache key did not match the requested inputs');
+          }
+
+          // Snapshot the exact content that was just analyzed so the staleness
+          // gate (#22) has a baseline keyed like analyzer statements.
+          displayResult(analysisResponse.result);
+          if (activeProjectId && cacheKey) {
+            storeResult(activeProjectId, cacheKey, analysisResponse.result);
           }
         }
 
@@ -515,14 +626,12 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
       activeProjectId,
       storeResult,
       setMetrics,
-      getMetrics,
       getResult,
-      buildAnalysisContext,
+      buildAnalysisPayload,
       validateFiles,
       setAnalyzing,
       setError,
-      hideCTEs,
-      enableLinting,
+      canUseMemoryCache,
       adapter,
     ]
   );
