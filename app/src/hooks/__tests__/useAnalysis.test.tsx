@@ -17,7 +17,7 @@ const lineageActions = vi.hoisted(() => ({
 let currentProject: Project | null = null;
 let activeProjectId: string | null = null;
 
-vi.mock('@pondpilot/flowscope-react', () => ({
+vi.mock('@flowscope-react/store', () => ({
   useLineageState: (selector: (state: { hideCTEs: boolean }) => unknown) =>
     selector({ hideCTEs: false }),
   useLineageActions: () => lineageActions,
