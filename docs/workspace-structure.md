@@ -18,7 +18,7 @@ flowscope/
 │   └── flowscope-export/         # Export helpers
 ├── packages/                     # NPM workspace
 │   ├── core/                     # @pondpilot/flowscope-core
-│   └── react/                    # @pondpilot/flowscope-react
+│   └── react/                    # Private @pondpilot/flowscope-react workspace
 ├── vscode/                       # VS Code extension
 │   └── webview-ui/               # Webview frontend
 ├── docs/                         # Documentation

@@ -45,7 +45,7 @@ FlowScope is organized as a monorepo with the following structure:
   - `flowscope-export/` - Export helpers
 - `packages/` - NPM workspace
   - `core/` - TypeScript wrapper (@pondpilot/flowscope-core)
-  - `react/` - React components (@pondpilot/flowscope-react)
+  - `react/` - Private React components workspace (@pondpilot/flowscope-react)
 - `app/` - Demo Vite application
 - `vscode/` - VS Code extension + webview UI
 - `docs/` - Documentation

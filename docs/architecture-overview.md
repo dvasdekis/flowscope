@@ -14,7 +14,7 @@ FlowScope is a Rust + TypeScript monorepo with a WASM boundary and optional UI l
    - `@pondpilot/flowscope-core`: TypeScript API + WASM loader.
 
 3. **UI & Integrations**
-   - `@pondpilot/flowscope-react`: React visualization components.
+   - `@pondpilot/flowscope-react`: Private React visualization workspace shared by the app and extension.
    - `app/`: Demo Vite app.
    - `vscode/`: VS Code extension + webview UI.
 

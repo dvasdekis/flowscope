@@ -9,7 +9,7 @@ This file applies to the entire FlowScope monorepo.
 FlowScope is a Rust + TypeScript monorepo.
 Key areas:
 - `crates/` Rust workspace (core engine, wasm, CLI, export).
-- `packages/` TypeScript packages (`@pondpilot/flowscope-core`, `@pondpilot/flowscope-react`).
+- `packages/` TypeScript workspaces (`@pondpilot/flowscope-core` and the private `@pondpilot/flowscope-react`).
 - `app/` demo web app (Vite + React).
 - `vscode/` VS Code extension + `vscode/webview-ui`.
 
@@ -176,9 +176,8 @@ Use a single repo tag for each release (`vX.Y.Z`) and align Rust workspace + npm
    - `cargo publish -p flowscope-core`
    - `cargo publish -p flowscope-export`
    - `cargo publish -p flowscope-cli`
-5. Publish npm packages:
+5. Publish the npm package:
    - `yarn workspace @pondpilot/flowscope-core publish --access public`
-   - `yarn workspace @pondpilot/flowscope-react publish --access public`
 6. Tag + release:
    - `git tag vX.Y.Z`
    - `git push origin vX.Y.Z`
@@ -186,5 +185,6 @@ Use a single repo tag for each release (`vX.Y.Z`) and align Rust workspace + npm
 
 ## Notes
 
+- `@pondpilot/flowscope-react` is a private workspace package and must not be published to npm.
 - The demo app (`app/`) has a Vitest suite. The VS Code webview (`vscode/webview-ui/`) currently defines no tests.
 - For full CI parity, `just check` runs formatting checks, lint, typecheck, and schema checks.

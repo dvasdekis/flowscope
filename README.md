@@ -116,14 +116,14 @@ See [CLI documentation](crates/flowscope-cli/README.md) for all options.
 - Auto-fix engine with safe and unsafe fix modes
 - Structured diagnostics with spans for precise highlighting
 - Completion API for SQL authoring workflows
-- TypeScript API and optional React visualization components
+- TypeScript API and shared React visualization components for the bundled app and extension
 - Librarian AI chat panel for natural-language Q&A over SQL lineage and uploaded PDF documentation (OpenAI, Anthropic, or custom endpoints)
 
 ## Components
 
 - `app/` — the hosted web application at [flowscope.pondpilot.io](https://flowscope.pondpilot.io)
 - `crates/` — Rust engine, WASM bindings, and CLI
-- `packages/` — TypeScript API and React visualization components
+- `packages/` — published TypeScript API and private React visualization workspace
 
 ## TypeScript API
 
@@ -185,11 +185,9 @@ console.log(result.items.slice(0, 5));
 
 ## Visualization
 
-For interactive lineage graphs, add the React package and render the `LineageExplorer` component. See [docs/guides/quickstart.md](docs/guides/quickstart.md) for a full walkthrough.
-
-```bash
-npm install @pondpilot/flowscope-react
-```
+The demo app and VS Code extension provide interactive lineage graphs. Their shared React
+components live in the repository's private `packages/react` workspace and are not published
+to npm. See [docs/guides/quickstart.md](docs/guides/quickstart.md) for a core API walkthrough.
 
 ## Documentation
 

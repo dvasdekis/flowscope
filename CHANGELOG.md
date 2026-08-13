@@ -7,14 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Kept `@pondpilot/flowscope-react` as a private monorepo workspace and removed it from the npm release pipeline
+
 ## [0.9.0] - 2026-08-12
 
 ### Added
 
-#### TypeScript API and React Package
+#### TypeScript API
 
 - **Schema-generated TypeScript API contracts** ([#57](https://github.com/pondpilot/flowscope/pull/57)) — generated public request and response types from the Rust API schema, added drift checks across every schema definition and dialect, and added a browser test against the real built WASM module
-- **Published React package** ([#53](https://github.com/pondpilot/flowscope/pull/53)) — added `@pondpilot/flowscope-react` to the tag-based npm release pipeline after the core package
 
 ### Improved
 

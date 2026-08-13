@@ -2,14 +2,17 @@
 
 React components for visualizing FlowScope lineage results.
 
+This is a private monorepo workspace shared by the FlowScope app and VS Code extension. It is
+not published to npm.
+
 ## Overview
 
 This package provides ready-to-use React components for rendering interactive lineage graphs and SQL editors integrated with FlowScope analysis results.
 
-## Installation
+## Development
 
 ```bash
-npm install @pondpilot/flowscope-react
+yarn workspace @pondpilot/flowscope-react build
 ```
 
 ## Usage
