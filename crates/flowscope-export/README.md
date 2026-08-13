@@ -22,8 +22,8 @@ Add it to your project alongside `flowscope-core`:
 
 ```toml
 [dependencies]
-flowscope-core = "0.8.0"
-flowscope-export = "0.8.0"
+flowscope-core = "0.9.0"
+flowscope-export = "0.9.0"
 ```
 
 ## License

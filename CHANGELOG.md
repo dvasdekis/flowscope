@@ -7,16 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-12
+
+### Added
+
+#### TypeScript API and React Package
+
+- **Schema-generated TypeScript API contracts** ([#57](https://github.com/pondpilot/flowscope/pull/57)) — generated public request and response types from the Rust API schema, added drift checks across every schema definition and dialect, and added a browser test against the real built WASM module
+- **Published React package** ([#53](https://github.com/pondpilot/flowscope/pull/53)) — added `@pondpilot/flowscope-react` to the tag-based npm release pipeline after the core package
+
+### Improved
+
+#### Web App (app/)
+
+- **Smaller production bundles** ([#59](https://github.com/pondpilot/flowscope/pull/59)) — removed the duplicate browser WASM payload, lazy-loaded optional features, and reduced the app distribution by 40% and entry JavaScript by 60%, with enforced bundle budgets
+- **Faster project editing** ([#64](https://github.com/pondpilot/flowscope/pull/64)) — debounced persistence, synchronized only changed worker files, preserved stable backend file references, and prevented stale async results from replacing explicit analyses
+
 ### Fixed
 
 #### Core Engine (flowscope-core)
 
-- **Bounded analysis inputs** — enforced UTF-8 byte limits before templating and parsing for inline and multi-file requests, with a 10 MiB per-source limit, a 100 MiB aggregate limit, and structured source-attributed errors
+- **Bounded analysis inputs** ([#63](https://github.com/pondpilot/flowscope/pull/63)) — enforced UTF-8 byte limits before templating and parsing for inline and multi-file requests, with a 10 MiB per-source limit, a 100 MiB aggregate limit, and structured source-attributed errors
 
 #### TypeScript API, Web App, and VS Code Extension
 
-- **Stable React store subscriptions** — added selector overloads for lineage state and actions, stabilized the legacy `useLineage()` object references, and prevented prop synchronization effects from rerunning on unrelated store updates
-- **Oracle dialect validation** — accepted `oracle` requests in the TypeScript runtime and synchronized Oracle across the app, VS Code settings, and supported-dialect documentation
+- **WASM initialization retries** ([#61](https://github.com/pondpilot/flowscope/pull/61)) — allowed later calls to recover from transient initialization failures and made reset and concurrent initialization race-safe
+- **Stable React store subscriptions** ([#56](https://github.com/pondpilot/flowscope/pull/56)) — added selector overloads for lineage state and actions, stabilized the legacy `useLineage()` object references, and prevented prop synchronization effects from rerunning on unrelated store updates
+- **Oracle dialect validation** ([#52](https://github.com/pondpilot/flowscope/pull/52)) — accepted `oracle` requests in the TypeScript runtime and synchronized Oracle across the app, VS Code settings, and supported-dialect documentation
+- **Semantic analysis caching** ([#51](https://github.com/pondpilot/flowscope/pull/51)) — keyed cached results by every analysis-affecting input so stale results are not restored after SQL, dialect, schema, template, lint, or file-selection changes
+- **Same-length SQL edit synchronization** ([#48](https://github.com/pondpilot/flowscope/pull/48)) — hashed file contents in worker synchronization keys so equal-length edits can no longer reuse stale SQL
+
+#### CLI (flowscope-cli)
+
+- **Serve-mode linting option** ([#60](https://github.com/pondpilot/flowscope/pull/60)) — honored the REST API's `enable_linting` field for enabled, disabled, and omitted requests
 
 ## [0.8.0] - 2026-08-11
 
