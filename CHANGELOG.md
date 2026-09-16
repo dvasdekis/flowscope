@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Kept `@pondpilot/flowscope-react` as a private monorepo workspace and removed it from the npm release pipeline
 
-## [0.9.1-synapse.1] - 2026-09-16
+## [0.9.1] - 2026-09-16
 
 ### Fixed
 
