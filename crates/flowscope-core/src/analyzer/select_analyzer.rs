@@ -43,6 +43,7 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
         self.analyze_projection(&select.projection);
         self.analyze_selection(&select.selection);
         self.analyze_having(&select.having);
+        self.analyze_qualify(&select.qualify);
     }
 
     /// Analyzes GROUP BY expressions to track grouping columns.
@@ -354,6 +355,14 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
             let mut ea = ExpressionAnalyzer::new(self.analyzer, self.ctx);
             ea.analyze(having_expr);
             ea.capture_filter_predicates(having_expr, FilterClauseType::Having);
+        }
+    }
+
+    fn analyze_qualify(&mut self, qualify: &Option<sqlparser::ast::Expr>) {
+        if let Some(qualify_expr) = qualify {
+            let mut ea = ExpressionAnalyzer::new(self.analyzer, self.ctx);
+            ea.analyze(qualify_expr);
+            ea.capture_filter_predicates(qualify_expr, FilterClauseType::Qualify);
         }
     }
 
