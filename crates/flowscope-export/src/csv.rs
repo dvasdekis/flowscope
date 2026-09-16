@@ -9,6 +9,7 @@ use zip::CompressionMethod;
 use crate::extract::{
     extract_column_mappings, extract_script_info, extract_table_dependencies, extract_table_info,
 };
+use crate::issue_export::{issue_rows, ISSUE_HEADERS};
 use crate::ExportError;
 
 pub fn export_csv_bundle(result: &AnalyzeResult) -> Result<Vec<u8>, ExportError> {
@@ -202,34 +203,26 @@ fn export_issues_csv(result: &AnalyzeResult) -> Result<Vec<u8>, ExportError> {
         .from_writer(Vec::new());
 
     writer
-        .write_record([
-            "Severity",
-            "Code",
-            "Message",
-            "Statement",
-            "Span Start",
-            "Span End",
-        ])
+        .write_record(ISSUE_HEADERS)
         .map_err(|err| ExportError::Csv(err.to_string()))?;
 
-    for issue in &result.issues {
-        let statement = issue
-            .statement_index
-            .map(|idx| idx.to_string())
-            .unwrap_or_default();
-        let (start, end) = issue
-            .span
-            .map(|span| (span.start.to_string(), span.end.to_string()))
-            .unwrap_or_default();
-
+    for issue in issue_rows(result) {
         writer
             .write_record([
-                format!("{:?}", issue.severity).to_lowercase(),
+                issue.severity.to_string(),
                 issue.code.clone(),
                 issue.message.clone(),
-                statement,
-                start,
-                end,
+                issue.statement,
+                issue.span_start,
+                issue.span_end,
+                issue.source_name,
+                issue.sqlfluff_name,
+                issue.lint_engine,
+                issue.lint_confidence,
+                issue.lint_fallback_source,
+                issue.autofix_applicability,
+                issue.autofix_edit_count,
+                issue.autofix_json,
             ])
             .map_err(|err| ExportError::Csv(err.to_string()))?;
     }

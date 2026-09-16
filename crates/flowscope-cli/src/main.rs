@@ -486,6 +486,18 @@ fn to_file_lint_result(
                 code: i.code.clone(),
                 message: i.message.clone(),
                 severity: i.severity,
+                metadata: {
+                    let mut metadata = serde_json::to_value(i).unwrap_or(serde_json::Value::Null);
+                    if let Some(object) = metadata.as_object_mut() {
+                        object.insert(
+                            "sourceName".to_string(),
+                            serde_json::Value::String(
+                                i.source_name.clone().unwrap_or_else(|| source.name.clone()),
+                            ),
+                        );
+                    }
+                    metadata
+                },
             }
         })
         .collect();

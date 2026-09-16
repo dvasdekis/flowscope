@@ -19,6 +19,8 @@ pub struct LintIssue {
     pub code: String,
     pub message: String,
     pub severity: Severity,
+    /// Structured issue metadata preserved for JSON consumers.
+    pub metadata: serde_json::Value,
 }
 
 /// Convert a byte offset into a 1-based (line, col) pair.
@@ -204,17 +206,42 @@ pub fn format_lint_json(results: &[FileLintResult], compact: bool) -> String {
                 .issues
                 .iter()
                 .map(|issue| {
-                    serde_json::json!({
-                        "line": issue.line,
-                        "column": issue.col,
-                        "code": sqlfluff_display_code(&issue.code),
-                        "message": issue.message,
-                        "severity": match issue.severity {
-                            Severity::Error => "error",
-                            Severity::Warning => "warning",
-                            Severity::Info => "info",
+                    let mut violation = serde_json::Map::from_iter([
+                        ("line".to_string(), serde_json::json!(issue.line)),
+                        ("column".to_string(), serde_json::json!(issue.col)),
+                        (
+                            "code".to_string(),
+                            serde_json::json!(sqlfluff_display_code(&issue.code)),
+                        ),
+                        ("message".to_string(), serde_json::json!(issue.message)),
+                        (
+                            "severity".to_string(),
+                            serde_json::json!(match issue.severity {
+                                Severity::Error => "error",
+                                Severity::Warning => "warning",
+                                Severity::Info => "info",
+                            }),
+                        ),
+                    ]);
+
+                    for key in [
+                        "sourceName",
+                        "statementIndex",
+                        "span",
+                        "sqlfluffName",
+                        "lintEngine",
+                        "lintConfidence",
+                        "lintFallbackSource",
+                        "autofix",
+                    ] {
+                        if let Some(value) = issue.metadata.get(key) {
+                            if !value.is_null() {
+                                violation.insert(key.to_string(), value.clone());
+                            }
                         }
-                    })
+                    }
+
+                    serde_json::Value::Object(violation)
                 })
                 .collect();
 
@@ -302,6 +329,7 @@ mod tests {
                     code: "LINT_AM_007".to_string(),
                     message: "Use UNION DISTINCT or UNION ALL instead of bare UNION.".to_string(),
                     severity: Severity::Info,
+                    metadata: serde_json::Value::Null,
                 },
                 LintIssue {
                     line: 7,
@@ -309,6 +337,7 @@ mod tests {
                     code: "LINT_ST_006".to_string(),
                     message: "CTE 'unused' is defined but never referenced.".to_string(),
                     severity: Severity::Info,
+                    metadata: serde_json::Value::Null,
                 },
             ],
         }];
@@ -348,6 +377,7 @@ mod tests {
                     code: "LINT_AM_007".to_string(),
                     message: "test".to_string(),
                     severity: Severity::Info,
+                    metadata: serde_json::Value::Null,
                 }],
             },
         ];
@@ -370,6 +400,7 @@ mod tests {
                 code: "LINT_AM_007".to_string(),
                 message: "Use UNION DISTINCT or UNION ALL.".to_string(),
                 severity: Severity::Info,
+                metadata: serde_json::Value::Null,
             }],
         }];
 

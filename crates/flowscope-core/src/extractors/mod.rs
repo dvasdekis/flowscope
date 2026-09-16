@@ -187,12 +187,77 @@ fn extract_tables_from_table_factor(table_factor: &TableFactor, tables: &mut Vec
         TableFactor::Unpivot { .. } => {}
         TableFactor::MatchRecognize { .. } => {}
         TableFactor::JsonTable { .. } => {}
-        // TODO: Implement table extraction for OPENJSON (SQL Server)
-        TableFactor::OpenJsonTable { .. } => {}
+        TableFactor::OpenJsonTable { json_expr, .. } => {
+            extract_tables_from_expr(json_expr, tables);
+        }
         // TODO: Implement table extraction for XMLTABLE
-        TableFactor::XmlTable { .. } => {}
+        TableFactor::XmlTable { passing, .. } => {
+            for argument in &passing.arguments {
+                extract_tables_from_expr(&argument.expr, tables);
+            }
+        }
         // TODO: Implement table extraction for semantic views
         TableFactor::SemanticView { .. } => {}
+    }
+}
+
+fn extract_tables_from_expr(expr: &sqlparser::ast::Expr, tables: &mut Vec<String>) {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() > 1 => {
+            tables.push(
+                parts[..parts.len() - 1]
+                    .iter()
+                    .map(|ident| ident.value.clone())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
+        }
+        Expr::Function(function) => {
+            if let FunctionArguments::List(arguments) = &function.args {
+                for argument in &arguments.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument {
+                        extract_tables_from_expr(argument, tables);
+                    }
+                }
+            }
+        }
+        Expr::Nested(inner) => extract_tables_from_expr(inner, tables),
+        Expr::Subquery(query) => extract_tables_from_query_body(&query.body, tables),
+        Expr::BinaryOp { left, right, .. } => {
+            extract_tables_from_expr(left, tables);
+            extract_tables_from_expr(right, tables);
+        }
+        Expr::UnaryOp { expr, .. } => extract_tables_from_expr(expr, tables),
+        Expr::Cast { expr, .. } => extract_tables_from_expr(expr, tables),
+        Expr::Extract { expr, .. } => extract_tables_from_expr(expr, tables),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                extract_tables_from_expr(operand, tables);
+            }
+            for condition in conditions {
+                extract_tables_from_expr(&condition.condition, tables);
+                extract_tables_from_expr(&condition.result, tables);
+            }
+            if let Some(else_result) = else_result {
+                extract_tables_from_expr(else_result, tables);
+            }
+        }
+        Expr::Exists { subquery, .. } => extract_tables_from_query_body(&subquery.body, tables),
+        Expr::InSubquery { subquery, expr, .. } => {
+            extract_tables_from_expr(expr, tables);
+            extract_tables_from_query_body(&subquery.body, tables);
+        }
+        _ => {
+            // Literals and expression forms without nested SQL relations do not
+            // contribute table names to the legacy extractor.
+        }
     }
 }
 

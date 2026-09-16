@@ -130,3 +130,50 @@ describe('exportToDuckDbSql', () => {
     );
   });
 });
+
+describe('export metadata payloads', () => {
+  beforeEach(() => {
+    wasmModuleMock.default.mockClear();
+    wasmModuleMock.default.mockImplementation(async () => undefined);
+    wasmModuleMock.export_html.mockClear();
+    wasmModuleMock.export_html.mockImplementation(() => '<html></html>');
+    wasmModuleMock.export_filename.mockClear();
+    wasmModuleMock.export_filename.mockImplementation(() => 'flowscope_export.xlsx');
+  });
+
+  afterEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it('serializes camelCase HTML export metadata', async () => {
+    const { exportHtml } = await loadAnalyzer();
+    const exportedAt = new Date('2026-01-18T12:30:05Z');
+
+    await exportHtml(baseResult, { projectName: 'Metadata Case', exportedAt });
+
+    const payload = JSON.parse(wasmModuleMock.export_html.mock.calls[0][0]);
+    expect(payload.projectName).toBe('Metadata Case');
+    expect(payload.exportedAt).toBe(exportedAt.toISOString());
+    expect(payload.project_name).toBeUndefined();
+    expect(payload.exported_at).toBeUndefined();
+  });
+
+  it('serializes camelCase filename metadata and format', async () => {
+    const { exportFilename } = await loadAnalyzer();
+    const exportedAt = new Date('2026-01-18T12:30:05Z');
+
+    await exportFilename({
+      projectName: 'Metadata Case',
+      exportedAt,
+      format: 'xlsx',
+    });
+
+    const payload = JSON.parse(wasmModuleMock.export_filename.mock.calls[0][0]);
+    expect(payload.projectName).toBe('Metadata Case');
+    expect(payload.exportedAt).toBe(exportedAt.toISOString());
+    expect(payload.format).toEqual({ type: 'xlsx' });
+    expect(payload.project_name).toBeUndefined();
+    expect(payload.exported_at).toBeUndefined();
+  });
+});

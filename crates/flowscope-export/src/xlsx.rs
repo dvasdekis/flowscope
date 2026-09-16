@@ -3,6 +3,7 @@ use rust_xlsxwriter::{Workbook, Worksheet};
 use crate::extract::{
     extract_column_mappings, extract_script_info, extract_table_dependencies, extract_table_info,
 };
+use crate::issue_export::{issue_rows, ISSUE_HEADERS};
 use crate::ExportError;
 use flowscope_core::AnalyzeResult;
 use std::collections::{BTreeSet, HashMap};
@@ -39,6 +40,12 @@ pub fn export_xlsx(result: &AnalyzeResult) -> Result<Vec<u8>, ExportError> {
         .set_name("Dependency Matrix")
         .map_err(|err| ExportError::Xlsx(err.to_string()))?;
     write_dependency_matrix_sheet(dependency_sheet, result)?;
+
+    let issues_sheet = workbook.add_worksheet();
+    issues_sheet
+        .set_name("Issues")
+        .map_err(|err| ExportError::Xlsx(err.to_string()))?;
+    write_issues_sheet(issues_sheet, result)?;
 
     workbook
         .save_to_buffer()
@@ -216,6 +223,34 @@ fn write_dependency_matrix_sheet(
         &["r", "Row table reads from column table"],
     )?;
     write_row(sheet, legend_start + 3, &["-", "Self (same table)"])?;
+
+    Ok(())
+}
+
+fn write_issues_sheet(sheet: &mut Worksheet, result: &AnalyzeResult) -> Result<(), ExportError> {
+    write_row(sheet, 0, &ISSUE_HEADERS)?;
+
+    for (index, issue) in issue_rows(result).iter().enumerate() {
+        let row = (index + 1) as u32;
+        let values = [
+            issue.severity.to_string(),
+            sanitize_xlsx_value(&issue.code),
+            sanitize_xlsx_value(&issue.message),
+            sanitize_xlsx_value(&issue.statement),
+            sanitize_xlsx_value(&issue.span_start),
+            sanitize_xlsx_value(&issue.span_end),
+            sanitize_xlsx_value(&issue.source_name),
+            sanitize_xlsx_value(&issue.sqlfluff_name),
+            sanitize_xlsx_value(&issue.lint_engine),
+            sanitize_xlsx_value(&issue.lint_confidence),
+            sanitize_xlsx_value(&issue.lint_fallback_source),
+            sanitize_xlsx_value(&issue.autofix_applicability),
+            sanitize_xlsx_value(&issue.autofix_edit_count),
+            sanitize_xlsx_value(&issue.autofix_json),
+        ];
+        let values: Vec<&str> = values.iter().map(String::as_str).collect();
+        write_row(sheet, row, &values)?;
+    }
 
     Ok(())
 }

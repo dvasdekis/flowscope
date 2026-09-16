@@ -1,13 +1,20 @@
+#[cfg(feature = "duckdb")]
 use duckdb::Connection;
 use flowscope_core::{
-    analyze, AggregationInfo, AnalyzeRequest, AnalyzeResult, Dialect, FilterClauseType,
-    FilterPredicate, Issue, Node, NodeType, Span, StatementMeta, Summary,
+    analyze,
+    types::{LintConfidence, LintEngine, LintFallbackSource},
+    AnalyzeRequest, AnalyzeResult, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span,
+    StatementMeta,
 };
-use flowscope_export::{
-    export_csv_bundle, export_html, export_json, export_mermaid, export_sql, export_xlsx,
-    ExportNaming, MermaidView,
-};
+#[cfg(feature = "duckdb")]
+use flowscope_core::{AggregationInfo, FilterClauseType, FilterPredicate, Node, NodeType, Summary};
+#[cfg(feature = "duckdb")]
+use flowscope_export::export_sql;
+use flowscope_export::{export_csv_bundle, export_html, export_json, export_xlsx, ExportNaming};
+use flowscope_export::{export_mermaid, MermaidView};
+#[cfg(feature = "duckdb")]
 use serde_json::json;
+#[cfg(feature = "duckdb")]
 use std::collections::HashMap;
 use std::io::Read;
 
@@ -63,6 +70,16 @@ fn exports_csv_archive() {
     let mut content = String::new();
     file.read_to_string(&mut content).expect("read csv content");
     assert!(content.contains("Source Table"));
+    drop(file);
+
+    let mut issues = archive.by_name("issues.csv").expect("issues file");
+    let mut issues_content = String::new();
+    issues
+        .read_to_string(&mut issues_content)
+        .expect("read issues content");
+    assert!(issues_content.starts_with(
+        "Severity,Code,Message,Statement,Span Start,Span End,Source Name,SQLFluff Name,Lint Engine,Lint Confidence,Lint Fallback Source,Autofix Applicability,Autofix Edit Count,Autofix JSON"
+    ));
 }
 
 #[test]
@@ -70,6 +87,77 @@ fn exports_xlsx_bytes() {
     let result = analyze_sample();
     let bytes = export_xlsx(&result).expect("xlsx export");
     assert!(!bytes.is_empty());
+}
+
+#[test]
+fn exports_issue_metadata_in_html_and_csv() {
+    let issue = Issue::warning("LINT_TEST", "<unsafe>, \"message\"\nnext")
+        .with_statement(7)
+        .with_span(Span::new(11, 16))
+        .with_sqlfluff_name("layout.test")
+        .with_lint_engine(LintEngine::Lexical)
+        .with_lint_confidence(LintConfidence::Medium)
+        .with_lint_fallback_source(LintFallbackSource::TokenizerFallback)
+        .with_autofix_edits(
+            IssueAutofixApplicability::Safe,
+            vec![
+                IssuePatchEdit::new(Span::new(11, 13), "  "),
+                IssuePatchEdit::new(Span::new(14, 16), "=value"),
+            ],
+        );
+    let mut result = AnalyzeResult {
+        statements: vec![StatementMeta {
+            statement_index: 7,
+            statement_type: "SELECT".to_string(),
+            source_name: Some("models/orders.sql".to_string()),
+            span: Some(Span::new(0, 20)),
+            join_count: 0,
+            complexity_score: 1,
+            resolved_sql: None,
+        }],
+        issues: vec![issue],
+        ..Default::default()
+    };
+    result.summary.issue_count.warnings = 1;
+
+    let html = export_html(
+        &result,
+        "Test Project",
+        ExportNaming::new("Test Project").exported_at(),
+    )
+    .expect("html export");
+    assert!(html.contains("Source"));
+    assert!(html.contains("models/orders.sql"));
+    assert!(html.contains("layout.test"));
+    assert!(html.contains("&lt;unsafe&gt;"));
+    assert!(!html.contains("<unsafe>"));
+
+    let bytes = export_csv_bundle(&result).expect("csv bundle");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip archive");
+    let mut file = archive.by_name("issues.csv").expect("issues file");
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .expect("read issues content");
+    let mut reader = csv::Reader::from_reader(content.as_bytes());
+    let headers = reader.headers().expect("csv headers").clone();
+    assert_eq!(headers.get(0), Some("Severity"));
+    assert_eq!(headers.get(6), Some("Source Name"));
+    assert_eq!(headers.get(13), Some("Autofix JSON"));
+    let row = reader
+        .records()
+        .next()
+        .expect("issue row")
+        .expect("csv row");
+    assert_eq!(&row[1], "LINT_TEST");
+    assert_eq!(&row[3], "7");
+    assert_eq!(&row[6], "models/orders.sql");
+    assert_eq!(&row[8], "lexical");
+    assert_eq!(&row[9], "medium");
+    assert_eq!(&row[10], "tokenizer_fallback");
+    assert_eq!(&row[11], "safe");
+    assert_eq!(&row[12], "2");
+    let autofix: serde_json::Value = serde_json::from_str(&row[13]).expect("autofix JSON");
+    assert_eq!(autofix["edits"][1]["replacement"], "=value");
 }
 
 /// Multi-statement regression for `representative_join_edge_ids`.
@@ -81,6 +169,7 @@ fn exports_xlsx_bytes() {
 /// representative logic should emit exactly one join row *per statement*
 /// (dedup across column-level edges sharing the same relation pair + join
 /// metadata) — so with two statements we expect exactly two join rows.
+#[cfg(feature = "duckdb")]
 #[test]
 fn sql_export_dedups_column_level_joins_and_preserves_per_statement_rows() {
     let sql = "SELECT u.id, o.total FROM users u JOIN orders o ON u.id = o.user_id;\n\
@@ -121,6 +210,7 @@ fn sql_export_dedups_column_level_joins_and_preserves_per_statement_rows() {
     }
 }
 
+#[cfg(feature = "duckdb")]
 #[test]
 fn sql_export_preserves_statement_scoped_filters_and_aggregations() {
     let mut table_metadata = HashMap::new();
@@ -226,6 +316,7 @@ fn sql_export_preserves_statement_scoped_filters_and_aggregations() {
     assert_eq!(aggregation_rows, vec![(0, Some("COUNT".to_string()))]);
 }
 
+#[cfg(feature = "duckdb")]
 #[test]
 fn sql_export_reindexes_statement_references_and_preserves_occurrence_spans() {
     let mut column_metadata = HashMap::new();

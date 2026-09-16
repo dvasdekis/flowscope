@@ -3454,13 +3454,17 @@ fn snowflake_qualify_clause_filters_window_results() {
 
     let result = run_analysis(sql, Dialect::Snowflake, None);
 
-    // QUALIFY is Snowflake-specific and may have limited support
-    // This test documents current behavior
-    // TODO: Verify QUALIFY clause support in Snowflake dialect
-    assert!(
-        result.summary.statement_count >= 1,
-        "QUALIFY clause should parse in Snowflake"
-    );
+    assert_eq!(result.summary.statement_count, 1);
+    assert!(!result.summary.has_errors);
+    let orders = result
+        .nodes
+        .iter()
+        .find(|node| node.label.as_ref().eq_ignore_ascii_case("orders"))
+        .expect("QUALIFY source table should be present");
+    assert!(orders.filters.iter().any(|filter| {
+        filter.clause_type == flowscope_core::FilterClauseType::Qualify
+            && filter.expression.contains("rn = 1")
+    }));
 }
 
 #[test]

@@ -40,6 +40,7 @@ struct ExportMermaidRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ExportHtmlRequest {
     result: AnalyzeResult,
     #[serde(default = "default_project_name")]
@@ -59,6 +60,7 @@ struct ExportXlsxRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ExportFilenameRequest {
     #[serde(default = "default_project_name")]
     project_name: String,
@@ -599,6 +601,36 @@ mod tests {
     fn test_get_version() {
         let version = get_version();
         assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn export_requests_deserialize_typescript_camel_case_fields() {
+        let html_request: ExportHtmlRequest = serde_json::from_value(serde_json::json!({
+            "result": AnalyzeResult::default(),
+            "projectName": "Metadata Case",
+            "exportedAt": "2026-01-18T12:30:05Z"
+        }))
+        .expect("HTML export request should deserialize");
+
+        assert_eq!(html_request.project_name, "Metadata Case");
+        assert_eq!(
+            html_request.exported_at.as_deref(),
+            Some("2026-01-18T12:30:05Z")
+        );
+
+        let filename_request: ExportFilenameRequest = serde_json::from_value(serde_json::json!({
+            "projectName": "Metadata Case",
+            "exportedAt": "2026-01-18T12:30:05Z",
+            "format": { "type": "xlsx" }
+        }))
+        .expect("filename export request should deserialize");
+
+        assert_eq!(filename_request.project_name, "Metadata Case");
+        assert_eq!(
+            filename_request.exported_at.as_deref(),
+            Some("2026-01-18T12:30:05Z")
+        );
+        assert!(matches!(filename_request.format, ExportFormatRequest::Xlsx));
     }
 
     // Note: Tests for export_to_duckdb_sql and analyze_and_export_sql cannot run

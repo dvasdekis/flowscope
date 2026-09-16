@@ -206,6 +206,22 @@ export interface Issue {
   message: string;
   span?: Span;
   statementIndex?: number;
+  sourceName?: string;
+  sqlfluffName?: string;
+  lintEngine?: 'semantic' | 'lexical' | 'document';
+  lintConfidence?: 'high' | 'medium' | 'low';
+  lintFallbackSource?: 'parser_fallback' | 'tokenizer_fallback' | 'heuristic_rule';
+  autofix?: IssueAutofix;
+}
+
+export interface IssueAutofix {
+  applicability: 'safe' | 'unsafe' | 'displayOnly';
+  edits: IssuePatchEdit[];
+}
+
+export interface IssuePatchEdit {
+  span: Span;
+  replacement: string;
 }
 
 export interface Summary {
