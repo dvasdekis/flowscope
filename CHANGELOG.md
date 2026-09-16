@@ -11,11 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Kept `@pondpilot/flowscope-react` as a private monorepo workspace and removed it from the npm release pipeline
 
+## [0.9.1-synapse.1] - 2026-09-16
+
 ### Fixed
 
-#### Core Engine (flowscope-core)
+- Improved MSSQL batch handling, multi-file diagnostic attribution, CLI lint metadata, and HTML/CSV/XLSX issue exports.
+- Preserved WASM HTML and filename export metadata from TypeScript callers.
 
-- **MSSQL `GO` batch separators** - treat standalone SQL Server batch separators as statement boundaries during analysis and statement splitting, including trailing separators and CRLF input.
+### Added
+
+- QUALIFY filter attribution and parsed OPENJSON/XMLTABLE source extraction.
+- Fork release assets for the CLI and the built core npm package.
 
 ## [0.9.0] - 2026-08-12
 

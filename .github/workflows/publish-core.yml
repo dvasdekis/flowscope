@@ -363,3 +363,60 @@ jobs:
           artifact-regex: '\Aflowscope-v.*(\.tar\.gz|\.zip|-SHA256SUMS)\Z'
           changes-file: ''
           generate-release-notes: true
+
+  publish-fork-core-package:
+    name: Publish fork core package asset
+    needs: publish-cli-binaries
+    if: ${{ github.repository != 'pondpilot/flowscope' && github.ref_type == 'tag' && needs.publish-cli-binaries.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build core package
+        run: yarn workspace @pondpilot/flowscope-core build
+
+      - name: Run core package tests
+        run: yarn workspace @pondpilot/flowscope-core test --silent
+
+      - name: Pack core package
+        working-directory: packages/core
+        run: |
+          mkdir -p ../../release-assets
+          npm pack --workspaces=false --pack-destination ../../release-assets
+          package=$(find ../../release-assets -maxdepth 1 -name '*.tgz' -print -quit)
+          test -n "$package"
+          mv "$package" "../../release-assets/flowscope-core-${GITHUB_REF_NAME}.tgz"
+
+      - name: Generate package checksum
+        run: |
+          set -euo pipefail
+          sha256sum "release-assets/flowscope-core-${GITHUB_REF_NAME}.tgz" \
+            > "release-assets/flowscope-core-${GITHUB_REF_NAME}-SHA256SUMS"
+
+      - name: Upload core package assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "release-assets/flowscope-core-${GITHUB_REF_NAME}.tgz" \
+            "release-assets/flowscope-core-${GITHUB_REF_NAME}-SHA256SUMS" \
+            --clobber
