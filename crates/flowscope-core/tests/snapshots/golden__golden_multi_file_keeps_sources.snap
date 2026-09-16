@@ -122,13 +122,15 @@ expression: cleaned
       "severity": "info",
       "code": "APPROXIMATE_LINEAGE",
       "message": "SELECT * from 'alpha_table' - column list unknown without schema metadata",
-      "statementIndex": 0
+      "statementIndex": 0,
+      "sourceName": "alpha.sql"
     },
     {
       "severity": "info",
       "code": "APPROXIMATE_LINEAGE",
       "message": "SELECT * from 'beta_table' - column list unknown without schema metadata",
-      "statementIndex": 1
+      "statementIndex": 1,
+      "sourceName": "beta.sql"
     }
   ],
   "summary": {
