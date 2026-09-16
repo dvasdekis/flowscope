@@ -448,7 +448,7 @@ export interface CanonicalName {
 export type ResolutionSource = 'imported' | 'implied' | 'unknown';
 
 /**
- * A filter predicate from a WHERE, HAVING, or JOIN ON clause.
+ * A filter predicate from a WHERE, HAVING, QUALIFY, or JOIN ON clause.
  */
 export interface FilterPredicate {
   /**
@@ -464,7 +464,7 @@ export interface FilterPredicate {
 /**
  * The type of SQL clause where a filter predicate appears.
  */
-export type FilterClauseType = 'WHERE' | 'HAVING' | 'JOIN_ON';
+export type FilterClauseType = 'WHERE' | 'HAVING' | 'QUALIFY' | 'JOIN_ON';
 
 /**
  * Information about aggregation applied to a column.

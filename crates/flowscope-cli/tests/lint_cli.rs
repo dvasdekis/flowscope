@@ -310,6 +310,17 @@ fn test_lint_json_format() {
     let arr = parsed.as_array().expect("Expected JSON array");
     assert_eq!(arr.len(), 1);
     assert!(!arr[0]["violations"].as_array().unwrap().is_empty());
+
+    let violation = &arr[0]["violations"][0];
+    assert_eq!(violation["sourceName"], sql_path.to_string_lossy().as_ref());
+    assert_eq!(violation["statementIndex"], 0);
+    assert!(violation["span"]["start"].is_number());
+    assert!(violation["span"]["end"].is_number());
+    assert_eq!(violation["sqlfluffName"], "ambiguous.union");
+    assert_eq!(violation["lintEngine"], "semantic");
+    assert_eq!(violation["lintConfidence"], "high");
+    assert_eq!(violation["autofix"]["applicability"], "safe");
+    assert!(violation["autofix"]["edits"].is_array());
 }
 
 #[test]

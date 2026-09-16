@@ -25,6 +25,7 @@ pub mod dali_compat;
 mod error;
 mod extract;
 mod html;
+mod issue_export;
 mod join_export;
 mod json;
 mod mermaid;

@@ -332,6 +332,7 @@ fn file_statements_produce_spans() {
         .span
         .expect("span should be present for file statement");
     assert_eq!(&file_sql[span.start..span.end], "missing_table");
+    assert_eq!(issue.source_name.as_deref(), Some("file.sql"));
 }
 
 #[test]
@@ -360,12 +361,69 @@ fn lint_document_rules_apply_to_each_file_in_multi_file_request() {
         .collect();
 
     assert_eq!(st012_issues.len(), 2, "expected one ST_012 issue per file");
-    assert!(
-        st012_issues
+    assert_eq!(st012_issues[0].statement_index, Some(0));
+    assert_eq!(st012_issues[0].source_name.as_deref(), Some("first.sql"));
+    assert_eq!(st012_issues[1].statement_index, Some(1));
+    assert_eq!(st012_issues[1].source_name.as_deref(), Some("second.sql"));
+}
+
+#[test]
+fn lint_issues_keep_global_statement_indices_within_each_file() {
+    let mut request = make_request("");
+    request.files = Some(vec![
+        FileSource {
+            name: "first.sql".to_string(),
+            content: "SELECT 1 UNION SELECT 2; SELECT 3 UNION SELECT 4;".to_string(),
+        },
+        FileSource {
+            name: "second.sql".to_string(),
+            content: "SELECT 5 UNION SELECT 6;".to_string(),
+        },
+    ]);
+    request.options = Some(AnalysisOptions {
+        lint: Some(LintConfig::default()),
+        ..Default::default()
+    });
+
+    let result = analyze(&request);
+    let union_issues: Vec<_> = result
+        .issues
+        .iter()
+        .filter(|issue| issue.code == issue_codes::LINT_AM_002)
+        .collect();
+
+    assert_eq!(union_issues.len(), 3);
+    assert_eq!(
+        union_issues
             .iter()
-            .all(|issue| issue.statement_index == Some(0)),
-        "document-level lint rules should run with per-document statement indices"
+            .map(|issue| (issue.source_name.as_deref(), issue.statement_index))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("first.sql"), Some(0)),
+            (Some("first.sql"), Some(1)),
+            (Some("second.sql"), Some(2)),
+        ]
     );
+}
+
+#[test]
+fn statementless_file_lint_issues_do_not_claim_another_statement() {
+    let mut request = make_request("");
+    request.files = Some(vec![FileSource {
+        name: "empty.sql".to_string(),
+        content: "-- noqa: disable=all\n".to_string(),
+    }]);
+    request.options = Some(AnalysisOptions {
+        lint: Some(LintConfig::default()),
+        ..Default::default()
+    });
+
+    let result = analyze(&request);
+
+    for issue in result.issues {
+        assert_eq!(issue.source_name.as_deref(), Some("empty.sql"));
+        assert_eq!(issue.statement_index, None);
+    }
 }
 
 #[test]

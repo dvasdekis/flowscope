@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use flowscope_core::AnalyzeResult;
 
 use crate::extract::{extract_column_mappings, extract_script_info, extract_table_info};
+use crate::issue_export::issue_rows;
 use crate::mermaid::{export_mermaid, MermaidView};
 
 pub fn export_html(
@@ -18,24 +19,38 @@ pub fn export_html(
     let scripts = extract_script_info(result);
     let tables = extract_table_info(result);
     let mappings = extract_column_mappings(result);
-    let issues = &result.issues;
-
     let export_date = exported_at.format("%Y-%m-%d %H:%M:%S UTC");
 
-    let issues_section = if issues.is_empty() {
+    let issues_section = if result.issues.is_empty() {
         String::new()
     } else {
-        let rows = issues
+        let rows = issue_rows(result)
             .iter()
             .map(|issue| {
-                let severity_class = severity_class(issue.severity);
-                let severity_label = severity_label(issue.severity);
+                let autofix = if issue.autofix_json.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<details><summary>{} ({} edits)</summary><code>{}</code></details>",
+                        escape_html(&issue.autofix_applicability),
+                        escape_html(&issue.autofix_edit_count),
+                        escape_html(&issue.autofix_json)
+                    )
+                };
                 format!(
-                    "<tr><td><span class=\"badge badge-{}\">{}</span></td><td>{}</td><td>{}</td></tr>",
-                    severity_class,
-                    escape_html(severity_label),
+                    "<tr><td><span class=\"badge badge-{}\">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    issue.severity,
+                    escape_html(issue.severity),
                     escape_html(&issue.code),
-                    escape_html(&issue.message)
+                    escape_html(&issue.message),
+                    escape_html(&issue.source_name),
+                    escape_html(&issue.statement),
+                    escape_html(&format!("{}..{}", issue.span_start, issue.span_end)),
+                    escape_html(&issue.sqlfluff_name),
+                    escape_html(&issue.lint_engine),
+                    escape_html(&issue.lint_confidence),
+                    escape_html(&issue.lint_fallback_source),
+                    autofix,
                 )
             })
             .collect::<Vec<_>>()
@@ -44,7 +59,7 @@ pub fn export_html(
         format!(
             "<div class=\"section-title\">Issues</div>\
 <table>\
-  <thead><tr><th>Severity</th><th>Code</th><th>Message</th></tr></thead>\
+  <thead><tr><th>Severity</th><th>Code</th><th>Message</th><th>Source</th><th>Statement</th><th>Span</th><th>SQLFluff Rule</th><th>Lint Engine</th><th>Confidence</th><th>Fallback</th><th>Autofix</th></tr></thead>\
   <tbody>{rows}</tbody>\
 </table>"
         )
@@ -293,20 +308,4 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#039;")
-}
-
-fn severity_class(severity: flowscope_core::Severity) -> &'static str {
-    match severity {
-        flowscope_core::Severity::Error => "error",
-        flowscope_core::Severity::Warning => "warning",
-        flowscope_core::Severity::Info => "info",
-    }
-}
-
-fn severity_label(severity: flowscope_core::Severity) -> &'static str {
-    match severity {
-        flowscope_core::Severity::Error => "ERROR",
-        flowscope_core::Severity::Warning => "WARNING",
-        flowscope_core::Severity::Info => "INFO",
-    }
 }

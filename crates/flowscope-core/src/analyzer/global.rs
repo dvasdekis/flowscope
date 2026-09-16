@@ -49,11 +49,21 @@ impl<'a> Analyzer<'a> {
         let summary = self.build_summary(&nodes);
         let resolved_schema = self.build_resolved_schema();
 
+        let mut issues = self.issues.clone();
+        for issue in &mut issues {
+            if issue.source_name.is_none() {
+                issue.source_name = issue
+                    .statement_index
+                    .and_then(|index| statements.get(index))
+                    .and_then(|statement| statement.source_name.clone());
+            }
+        }
+
         crate::AnalyzeResult {
             statements,
             nodes,
             edges,
-            issues: self.issues.clone(),
+            issues,
             summary,
             resolved_schema,
         }

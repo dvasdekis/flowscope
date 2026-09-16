@@ -640,7 +640,7 @@ impl Edge {
     }
 }
 
-/// A filter predicate from a WHERE, HAVING, or JOIN ON clause.
+/// A filter predicate from a WHERE, HAVING, QUALIFY, or JOIN ON clause.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterPredicate {
@@ -659,6 +659,8 @@ pub enum FilterClauseType {
     Where,
     /// HAVING clause (after GROUP BY)
     Having,
+    /// QUALIFY clause (after window evaluation)
+    Qualify,
     /// JOIN ... ON clause
     JoinOn,
 }

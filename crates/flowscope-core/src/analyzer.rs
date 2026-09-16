@@ -439,7 +439,17 @@ impl<'a> Analyzer<'a> {
                 parser_fallback_used,
                 Some(source_statement_ranges),
             );
-            self.issues.extend(linter.check_document(&document));
+            let mut lint_issues = linter.check_document(&document);
+            for issue in &mut lint_issues {
+                if let Some(local_index) = issue.statement_index {
+                    issue.statement_index =
+                        (start + local_index < end).then_some(start + local_index);
+                }
+                if issue.source_name.is_none() {
+                    issue.source_name = source_name_key.map(str::to_owned);
+                }
+            }
+            self.issues.extend(lint_issues);
 
             start = end;
         }
@@ -456,14 +466,28 @@ impl<'a> Analyzer<'a> {
             }
             for file in files {
                 let document = LintDocument::new(&file.content, self.request.dialect, Vec::new());
-                self.issues.extend(linter.check_document(&document));
+                let mut lint_issues = linter.check_document(&document);
+                for issue in &mut lint_issues {
+                    issue.statement_index = None;
+                    if issue.source_name.is_none() {
+                        issue.source_name = Some(file.name.clone());
+                    }
+                }
+                self.issues.extend(lint_issues);
             }
             return;
         }
 
         if !self.request.sql.is_empty() {
             let document = LintDocument::new(&self.request.sql, self.request.dialect, Vec::new());
-            self.issues.extend(linter.check_document(&document));
+            let mut lint_issues = linter.check_document(&document);
+            for issue in &mut lint_issues {
+                issue.statement_index = None;
+                if issue.source_name.is_none() {
+                    issue.source_name = self.request.source_name.clone();
+                }
+            }
+            self.issues.extend(lint_issues);
         }
     }
 
