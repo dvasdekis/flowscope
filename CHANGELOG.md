@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-23
+
 ### Changed
 
 - Kept `@pondpilot/flowscope-react` as a private monorepo workspace and removed it from the npm release pipeline
+- Consolidated CLI performance validation with CLI Serve Mode and reused Cargo build caches across CI and release workflows.
+
+### Fixed
+
+- Ensured fork releases upload the core package archive after CLI binaries are published.
 
 ## [0.9.1] - 2026-09-16
 
