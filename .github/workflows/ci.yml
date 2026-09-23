@@ -31,6 +31,8 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Run Rust tests
         run: cargo test --workspace --locked
@@ -43,72 +45,6 @@ jobs:
 
       - name: Verify API schema snapshot
         run: cargo test -p flowscope-core --test schema_guard --locked
-
-  cli-fix-perf:
-    name: CLI Fix Perf Gate
-    runs-on: ubuntu-latest
-    env:
-      CLI_FIX_PERF_BUDGET_MS: 5000
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.95.0
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-cli-fix-perf-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build CLI release binary
-        run: cargo build -p flowscope-cli --release --locked
-
-      - name: Benchmark CLI fix batch performance
-        run: |
-          python3 scripts/sql-corpus-fix-benchmark.py \
-            --sql-dir crates/flowscope-core/tests/fixtures/postgres \
-            --dialect postgres \
-            --mode batch \
-            --json-output /tmp/fs_cli_fix_perf.json
-
-      - name: Enforce perf budget
-        run: |
-          python3 - <<'PY'
-          import json
-          import pathlib
-          import os
-
-          report = pathlib.Path('/tmp/fs_cli_fix_perf.json')
-          payload = json.loads(report.read_text())
-          elapsed_ms = float(payload['result']['elapsed_ms'])
-          budget_ms = float(os.environ['CLI_FIX_PERF_BUDGET_MS'])
-          print(f'CLI fix batch elapsed={elapsed_ms:.3f}ms (budget={budget_ms:.1f}ms)')
-          summary = pathlib.Path('/tmp/fs_cli_fix_perf_summary.txt')
-          summary.write_text(
-              f'elapsed_ms={elapsed_ms:.3f}\n'
-              f'budget_ms={budget_ms:.1f}\n'
-              f'sql_dir={payload["sql_dir"]}\n'
-          )
-          if elapsed_ms > budget_ms:
-              raise SystemExit(
-                  f'CLI fix performance regression: elapsed {elapsed_ms:.3f}ms exceeds budget {budget_ms:.1f}ms'
-              )
-          PY
-
-      - name: Upload perf telemetry
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cli-fix-perf
-          path: |
-            /tmp/fs_cli_fix_perf.json
-            /tmp/fs_cli_fix_perf_summary.txt
 
   wasm-build:
     name: WASM Build
@@ -134,6 +70,9 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+            ${{ runner.os }}-cargo-
 
       - name: Build browser WASM
         run: wasm-pack build crates/flowscope-wasm --target web --out-dir ../../packages/core/wasm
@@ -211,12 +150,12 @@ jobs:
 
   schema-compat:
     name: Schema Compatibility (Rust ↔ TS)
+    needs:
+      - rust-test
+      - typescript
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -227,14 +166,14 @@ jobs:
       - name: Install JS deps
         run: cd packages/core && yarn install --frozen-lockfile
 
-      - name: Verify schema snapshots
-        run: |
-          cargo test -p flowscope-core --test schema_guard --locked
-          cd packages/core && yarn test schema-compat.test.ts --silent
+      - name: Verify TypeScript schema compatibility
+        run: cd packages/core && yarn test schema-compat.test.ts --silent
 
   cli-serve:
-    name: CLI Serve Mode
+    name: CLI Serve Mode & Fix Perf Gate
     runs-on: ubuntu-latest
+    env:
+      CLI_FIX_PERF_BUDGET_MS: 5000
     steps:
       - uses: actions/checkout@v4
 
@@ -257,6 +196,9 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-serve-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-serve-
+            ${{ runner.os }}-cargo-
 
       - name: Install JS dependencies
         run: yarn install
@@ -272,6 +214,50 @@ jobs:
 
       - name: Build CLI with serve feature
         run: cargo build -p flowscope-cli --features serve --release
+
+      # Reuse the CLI built above; don't compile a second release binary just
+      # for this latency regression gate.
+      - name: Benchmark CLI fix batch performance
+        run: |
+          python3 scripts/sql-corpus-fix-benchmark.py \
+            --flowscope-bin target/release/flowscope \
+            --sql-dir crates/flowscope-core/tests/fixtures/postgres \
+            --dialect postgres \
+            --mode batch \
+            --json-output /tmp/fs_cli_fix_perf.json
+
+      - name: Enforce perf budget
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import os
+
+          report = pathlib.Path('/tmp/fs_cli_fix_perf.json')
+          payload = json.loads(report.read_text())
+          elapsed_ms = float(payload['result']['elapsed_ms'])
+          budget_ms = float(os.environ['CLI_FIX_PERF_BUDGET_MS'])
+          print(f'CLI fix batch elapsed={elapsed_ms:.3f}ms (budget={budget_ms:.1f}ms)')
+          summary = pathlib.Path('/tmp/fs_cli_fix_perf_summary.txt')
+          summary.write_text(
+              f'elapsed_ms={elapsed_ms:.3f}\n'
+              f'budget_ms={budget_ms:.1f}\n'
+              f'sql_dir={payload["sql_dir"]}\n'
+          )
+          if elapsed_ms > budget_ms:
+              raise SystemExit(
+                  f'CLI fix batch performance regression: elapsed {elapsed_ms:.3f}ms exceeds {budget_ms:.1f}ms'
+              )
+          PY
+
+      - name: Upload perf telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-fix-perf
+          path: |
+            /tmp/fs_cli_fix_perf.json
+            /tmp/fs_cli_fix_perf_summary.txt
 
       - name: Run CLI serve tests
         run: cargo test -p flowscope-cli --features serve
@@ -299,6 +285,9 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-database-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-database-integration-
+            ${{ runner.os }}-cargo-
 
       - name: Run database integration tests
         run: just test-integration
@@ -341,6 +330,9 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+            ${{ runner.os }}-cargo-
 
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info

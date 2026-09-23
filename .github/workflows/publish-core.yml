@@ -39,6 +39,23 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
+      - name: Cache Cargo for package release build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/src/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+            target/
+          key: ${{ runner.os }}-cargo-package-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-package-release-
+            ${{ runner.os }}-cargo-wasm-
+            ${{ runner.os }}-cargo-
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -174,6 +191,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Cargo for CLI target
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry/index/
+            /usr/local/cargo/registry/cache/
+            /usr/local/cargo/registry/src/
+            /usr/local/cargo/git/db/
+            /usr/local/cargo/git/checkouts/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-
+
       - name: Resolve CLI version
         id: cli_version
         shell: bash
@@ -239,6 +270,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Cargo for CLI target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/src/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.platform.target }}-
 
       - name: Resolve CLI version
         id: cli_version
@@ -382,6 +428,23 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Cargo for WASM package build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/src/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+            target/
+          key: ${{ runner.os }}-cargo-fork-core-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fork-core-
+            ${{ runner.os }}-cargo-wasm-
+            ${{ runner.os }}-cargo-
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.95.0
