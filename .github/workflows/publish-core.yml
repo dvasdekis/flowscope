@@ -367,7 +367,16 @@ jobs:
   publish-fork-core-package:
     name: Publish fork core package asset
     needs: publish-cli-binaries
-    if: ${{ github.repository != 'pondpilot/flowscope' && github.ref_type == 'tag' && needs.publish-cli-binaries.result == 'success' }}
+    # The package-publish job is intentionally skipped on forks. `always()` is
+    # required to let this fork-only asset job run after the CLI release job
+    # succeeds despite that skipped ancestor.
+    if: >-
+      ${{
+        always() &&
+        github.repository != 'pondpilot/flowscope' &&
+        startsWith(github.ref, 'refs/tags/v') &&
+        needs.publish-cli-binaries.result == 'success'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
