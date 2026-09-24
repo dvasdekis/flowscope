@@ -1219,6 +1219,7 @@ mod tests {
             "SELECT 1;\nGO\nSELECT 2;\nGO\n",
             "SELECT 1;\r\n  go  \r\nSELECT 2;\r\nGO\r\n",
             "SELECT 1\nGO\nGO\nSELECT 2\nGO\n",
+            "GO\nSELECT 1;\nGO\nSELECT 2;\nGO\n",
         ] {
             let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql);
             assert_eq!(ranges.len(), 2, "unexpected ranges for {sql:?}");
@@ -1265,6 +1266,21 @@ mod tests {
             issues.is_empty(),
             "MSSQL trailing GO should not produce parse errors: {issues:?}"
         );
+    }
+
+    #[test]
+    fn best_effort_mssql_go_batches_only_report_invalid_statement() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "SELECT 1;\nGO\nSELECT FROM;\nGO\nSELECT 2;\nGO\n".to_string();
+
+        let (statements, issues) = collect_statements(&request);
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(issues.len(), 1, "only invalid SQL should fail: {issues:?}");
+        assert_eq!(issues[0].code, issue_codes::PARSE_ERROR);
+        let span = issues[0].span.expect("invalid statement span");
+        assert_eq!(&request.sql[span.start..span.end], "SELECT FROM");
     }
 
     #[test]

@@ -44,7 +44,7 @@ const harness = `<!doctype html>
       const errors = result.issues.filter((issue) => issue.severity === 'error');
 
       const mssqlRequest = {
-        sql: 'SELECT 1;\nGO\nSELECT 2;\nGO\n',
+        sql: 'SELECT 1;\\nGO\\nSELECT 2;\\nGO\\n',
         dialect: 'mssql',
       };
       const mssqlResult = JSON.parse(analyze_sql_json(JSON.stringify(mssqlRequest)));
