@@ -583,7 +583,7 @@ impl<'a> ExternalMetadataParser<'a> {
             ));
         }
         self.position = close_after_condition;
-        self.expect_keyword("BEGIN")?;
+        let block_body = self.consume_keyword("BEGIN");
         let body_start_position = self.position;
         self.expect_keyword("CREATE")?;
         self.expect_keyword("EXTERNAL")?;
@@ -599,25 +599,35 @@ impl<'a> ExternalMetadataParser<'a> {
             })?
             .start;
 
-        let mut end_positions = self.position..self.tokens.len();
-        let end_position = end_positions
-            .find(|position| is_keyword(&self.tokens[*position].token, "END"))
-            .ok_or_else(|| {
-                self.error(
-                    "Expected END after conditional CREATE EXTERNAL FILE FORMAT",
-                    ParseErrorKind::UnexpectedEof,
-                )
-            })?;
-        let end_offset = token_byte_range(self.source_sql, self.tokens[end_position])
-            .ok_or_else(|| {
-                self.error_at(
-                    Some(self.tokens[end_position]),
-                    "Could not determine the conditional block source range",
-                    ParseErrorKind::SyntaxError,
-                )
-            })?
-            .start;
-        let body_sql = self.source_sql.get(body_start..end_offset).ok_or_else(|| {
+        let end_position = if block_body {
+            Some(
+                (self.position..self.tokens.len())
+                    .find(|position| is_keyword(&self.tokens[*position].token, "END"))
+                    .ok_or_else(|| {
+                        self.error(
+                            "Expected END after conditional CREATE EXTERNAL FILE FORMAT",
+                            ParseErrorKind::UnexpectedEof,
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let body_end = match end_position {
+            Some(end_position) => {
+                token_byte_range(self.source_sql, self.tokens[end_position])
+                    .ok_or_else(|| {
+                        self.error_at(
+                            Some(self.tokens[end_position]),
+                            "Could not determine the conditional block source range",
+                            ParseErrorKind::SyntaxError,
+                        )
+                    })?
+                    .start
+            }
+            None => self.source_sql.len(),
+        };
+        let body_sql = self.source_sql.get(body_start..body_end).ok_or_else(|| {
             self.error(
                 "Could not read the conditional external file format source range",
                 ParseErrorKind::SyntaxError,
@@ -628,18 +638,20 @@ impl<'a> ExternalMetadataParser<'a> {
         let Some(ExternalMetadataStatement::FileFormat(format)) = body else {
             return Err(self.error_at(
                 Some(self.tokens[body_start_position]),
-                "Expected CREATE EXTERNAL FILE FORMAT in the IF NOT EXISTS block",
+                "Expected CREATE EXTERNAL FILE FORMAT as the IF NOT EXISTS body",
                 ParseErrorKind::SyntaxError,
             ));
         };
 
-        self.position = end_position + 1;
-        self.consume_token(|token| matches!(token, Token::SemiColon));
-        if self.peek().is_some() {
-            return Err(self.error(
-                "Unexpected token after conditional CREATE EXTERNAL FILE FORMAT",
-                ParseErrorKind::SyntaxError,
-            ));
+        if let Some(end_position) = end_position {
+            self.position = end_position + 1;
+            self.consume_token(|token| matches!(token, Token::SemiColon));
+            if self.peek().is_some() {
+                return Err(self.error(
+                    "Unexpected token after conditional CREATE EXTERNAL FILE FORMAT",
+                    ParseErrorKind::SyntaxError,
+                ));
+            }
         }
         Ok(Some(ExternalMetadataStatement::ConditionalFileFormat(
             format,
@@ -1392,6 +1404,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_single_statement_guarded_file_formats_with_or_without_semicolons() {
+        let cases = [
+            (
+                concat!(
+                    "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
+                    "WHERE name = 'demo_parquet') CREATE EXTERNAL FILE FORMAT ",
+                    "demo_parquet WITH (FORMAT_TYPE = PARQUET)"
+                ),
+                ExternalFileFormatType::Parquet,
+                0,
+            ),
+            (
+                concat!(
+                    "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
+                    "WHERE name = 'demo_text') CREATE EXTERNAL FILE FORMAT ",
+                    "demo_text WITH (FORMAT_TYPE = DELIMITEDTEXT, ",
+                    "FORMAT_OPTIONS (FIELD_TERMINATOR = ','));"
+                ),
+                ExternalFileFormatType::DelimitedText,
+                1,
+            ),
+        ];
+
+        for (sql, expected_format, expected_options) in cases {
+            let metadata = parse_format(sql)
+                .expect("valid single-statement guarded metadata")
+                .expect("guarded external file format");
+            let ExternalMetadataStatement::ConditionalFileFormat(format) = metadata else {
+                panic!("expected guarded external file format");
+            };
+            assert_eq!(format.format, expected_format);
+            assert_eq!(format.format_options.len(), expected_options);
+        }
+    }
+
+    #[test]
     fn rejects_malformed_external_table_definitions_and_option_order() {
         let malformed_columns =
             "/* café */ CREATE EXTERNAL TABLE dbo.demo_table (id INT, label) WITH \
@@ -1434,12 +1482,23 @@ mod tests {
         for sql in [
             "IF NOT EXISTS (SELECT FROM sys.external_file_formats WHERE name = 'demo_format') \
              BEGIN CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); END",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
+             CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET, UNKNOWN = 1)",
             "IF EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
              BEGIN CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); END",
             "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
              BEGIN CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET);",
             "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
-             CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET)",
+             BEGIN CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); END \
+             ELSE SELECT 1",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
+             CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET) ELSE SELECT 1",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
+             CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); ELSE SELECT 1",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
+             CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = CSV)",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
+             CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); SELECT 1",
             "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
              BEGIN CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = CSV); END",
             "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
@@ -1450,6 +1509,24 @@ mod tests {
                 "malformed guarded DDL must remain an error: {sql}"
             );
         }
+
+        let malformed_body = concat!(
+            "/* café */ IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
+            "WHERE name = 'demo_format') CREATE EXTERNAL FILE FORMAT demo_format ",
+            "WITH (FORMAT_TYPE = CSV)"
+        );
+        let error = parse_format(malformed_body).expect_err("malformed body must fail parsing");
+        let error_position = error.position.expect("body error position");
+        let error_offset = crate::analyzer::helpers::line_col_to_offset(
+            malformed_body,
+            error_position.line,
+            error_position.column,
+        )
+        .expect("body error offset");
+        assert!(
+            error_offset >= malformed_body.find("FORMAT_TYPE").expect("body option"),
+            "body error coordinates must map to the original conditional"
+        );
 
         let malformed_query = concat!(
             "/* café */ IF NOT EXISTS (SELECT FROM sys.external_file_formats ",

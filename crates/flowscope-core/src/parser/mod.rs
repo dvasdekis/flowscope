@@ -4,9 +4,11 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+mod mssql_dialect;
 mod mssql_module;
 
 /// Result of parsing SQL with fallback metadata.
+#[derive(Debug)]
 pub struct ParseSqlOutput {
     pub statements: Vec<Statement>,
     pub parser_fallback_used: bool,
@@ -22,7 +24,12 @@ pub fn parse_sql_with_dialect_output(
     sql: &str,
     dialect: Dialect,
 ) -> Result<ParseSqlOutput, ParseError> {
-    let sqlparser_dialect = dialect.to_sqlparser_dialect();
+    let sqlparser_dialect: Box<dyn sqlparser::dialect::Dialect> =
+        if matches!(dialect, Dialect::Mssql) {
+            Box::new(mssql_dialect::MssqlParserDialect::default())
+        } else {
+            dialect.to_sqlparser_dialect()
+        };
     match Parser::parse_sql(sqlparser_dialect.as_ref(), sql) {
         Ok(statements) => Ok(ParseSqlOutput {
             statements,
@@ -685,5 +692,122 @@ mod tests {
         let output = parse_sql_with_dialect_output(sql, Dialect::Generic).expect("parse");
         assert!(!output.parser_fallback_used);
         assert_eq!(output.statements.len(), 1);
+    }
+
+    #[test]
+    fn test_mssql_nonreserved_trim_identifier_preserves_ast_and_span() {
+        let sql = "SELECT 1 WHERE TRIM = 'demo';";
+        let output = parse_sql_with_dialect_output(sql, Dialect::Mssql).expect("parse");
+
+        assert!(!output.parser_fallback_used);
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let Some(sqlparser::ast::Expr::BinaryOp { left, right, .. }) = &select.selection else {
+            panic!("expected comparison");
+        };
+        let sqlparser::ast::Expr::Identifier(identifier) = left.as_ref() else {
+            panic!("expected unquoted TRIM identifier, got {left:?}");
+        };
+
+        assert_eq!(identifier.value, "TRIM");
+        assert_eq!(identifier.quote_style, None);
+        assert_eq!(identifier.span.start.line, 1);
+        assert_eq!(identifier.span.start.column, 16);
+        assert_eq!(identifier.span.end.column, 20);
+        assert!(matches!(right.as_ref(), sqlparser::ast::Expr::Value(_)));
+    }
+
+    #[test]
+    fn test_mssql_other_nonreserved_special_keyword_falls_back_to_identifier() {
+        let output =
+            parse_sql_with_dialect_output("SELECT 1 WHERE SUBSTRING = 'demo';", Dialect::Mssql)
+                .expect("parse");
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let Some(sqlparser::ast::Expr::BinaryOp { left, .. }) = &select.selection else {
+            panic!("expected comparison");
+        };
+        let sqlparser::ast::Expr::Identifier(identifier) = left.as_ref() else {
+            panic!("expected unquoted SUBSTRING identifier, got {left:?}");
+        };
+
+        assert_eq!(identifier.value, "SUBSTRING");
+        assert_eq!(identifier.span.start.column, 16);
+    }
+
+    #[test]
+    fn test_mssql_trim_function_and_literal_forms_remain_special_expressions() {
+        for sql in ["SELECT TRIM(value)", "SELECT TRIM(' demo ')"] {
+            let output = parse_sql_with_dialect_output(sql, Dialect::Mssql).expect("parse");
+            let Statement::Query(query) = &output.statements[0] else {
+                panic!("expected query");
+            };
+            let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("expected select");
+            };
+            let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+                panic!("expected expression");
+            };
+            let sqlparser::ast::Expr::Trim { expr, .. } = expr else {
+                panic!("expected TRIM expression, got {expr:?}");
+            };
+
+            match expr.as_ref() {
+                sqlparser::ast::Expr::Identifier(identifier) => {
+                    assert_eq!(identifier.value, "value")
+                }
+                sqlparser::ast::Expr::Value(_) => {}
+                other => panic!("unexpected TRIM argument: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_mssql_nonreserved_trim_works_in_qualified_expression() {
+        let output =
+            parse_sql_with_dialect_output("SELECT 1 WHERE dbo.TRIM = 'demo';", Dialect::Mssql)
+                .expect("parse");
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let Some(sqlparser::ast::Expr::BinaryOp { left, .. }) = &select.selection else {
+            panic!("expected comparison");
+        };
+
+        let sqlparser::ast::Expr::CompoundIdentifier(parts) = left.as_ref() else {
+            panic!("expected qualified identifier, got {left:?}");
+        };
+        assert_eq!(parts[0].value, "dbo");
+        assert_eq!(parts[1].value, "TRIM");
+        assert_eq!(parts[1].span.start.column, 20);
+    }
+
+    #[test]
+    fn test_mssql_reserved_special_expression_does_not_fall_back_to_identifier() {
+        let sql = "SELECT 1 WHERE EXISTS = 'demo';";
+        assert!(parse_sql_with_dialect_output(sql, Dialect::Mssql).is_err());
+    }
+
+    #[test]
+    fn test_mssql_malformed_trim_expression_still_fails() {
+        let sql = "SELECT TRIM('demo' FROM)";
+        assert!(parse_sql_with_dialect_output(sql, Dialect::Mssql).is_err());
+    }
+
+    #[test]
+    fn test_non_mssql_trim_keyword_behavior_is_unchanged() {
+        let sql = "SELECT 1 WHERE TRIM = 'demo';";
+        assert!(parse_sql_with_dialect_output(sql, Dialect::Generic).is_err());
     }
 }

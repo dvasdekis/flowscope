@@ -214,3 +214,16 @@ fn cli_accepts_measured_external_metadata_and_batch_shapes() {
         assert!(!has_issue(&result, "PARSE_ERROR"));
     }
 }
+
+#[test]
+fn cli_accepts_bare_metadata_guard_and_both_data_source_placements() {
+    for sql in [
+        "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET)",
+        "SELECT src.id FROM OPENROWSET(BULK ('data/a.parquet'), FORMAT = 'PARQUET', DATA_SOURCE = 'demo_storage') WITH (id INT) AS src",
+        "SELECT 1 WHERE TRIM = 'demo'",
+    ] {
+        let result = analyze_mssql(sql);
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert!(!has_issue(&result, "PARSE_ERROR"));
+    }
+}

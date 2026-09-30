@@ -1069,7 +1069,6 @@ fn mssql_synapse_openrowset_argument_replacements(
         .find_map(|(index, ch)| matches!(ch, ' ' | '\t').then_some(bulk_range.end + index))?;
     let mut replacements = vec![bulk_separator];
     let mut seen_options = std::collections::HashSet::new();
-    let mut seen_data_source = false;
     let mut seen_format = false;
 
     for range in argument_ranges.iter().skip(1) {
@@ -1094,12 +1093,7 @@ fn mssql_synapse_openrowset_argument_replacements(
         }
         if option == "FORMAT" {
             seen_format = true;
-        } else if option == "DATA_SOURCE" {
-            if seen_format || seen_data_source {
-                return None;
-            }
-            seen_data_source = true;
-        } else if !seen_format {
+        } else if option != "DATA_SOURCE" && !seen_format {
             return None;
         }
         let equals_range = mssql_token_byte_range(sql, &tokens[equals_index])?;
@@ -2849,34 +2843,98 @@ mod tests {
     }
 
     #[test]
-    fn mssql_synapse_openrowset_rejects_data_source_after_format() {
-        let sql =
-            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 'lake') AS r";
-
-        assert!(mssql_openrowset_compatible_sql(sql).is_none());
-        let error = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
-            .err()
-            .expect("DATA_SOURCE-after-FORMAT is outside the documented Synapse grammar");
-        assert!(error.position.is_some());
-        assert_eq!(
-            error.position,
-            parse_sql_with_dialect_output(sql, Dialect::Mssql)
-                .err()
-                .expect("the upstream parser rejects the documented-invalid order")
-                .position,
-            "the MSSQL adapter must preserve the original parser diagnostic location"
+    fn mssql_synapse_openrowset_accepts_data_source_after_format() {
+        let sql = concat!(
+            "-- café\r\n",
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', ",
+            "DATA_SOURCE = 'lake') AS r"
         );
+        let compatible_sql =
+            mssql_openrowset_compatible_sql(sql).expect("recognized Synapse option ordering");
+        assert_eq!(compatible_sql.len(), sql.len());
+        assert_eq!(
+            compatible_sql.matches('\n').count(),
+            sql.matches('\n').count()
+        );
+        assert_eq!(
+            compatible_sql.find("DATA_SOURCE"),
+            sql.find("DATA_SOURCE"),
+            "one-byte rewrites must preserve original source offsets"
+        );
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse FORMAT-before-DATA_SOURCE Synapse syntax");
+        assert!(output.parser_fallback_used);
+        assert_eq!(output.statements.len(), 1);
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        let TableFactor::Table {
+            args: Some(args), ..
+        } = &select.from[0].relation
+        else {
+            panic!("expected OPENROWSET table-valued function");
+        };
+        let argument_names: Vec<_> = args
+            .args
+            .iter()
+            .map(|argument| match argument {
+                sqlparser::ast::FunctionArg::ExprNamed {
+                    name: sqlparser::ast::Expr::Identifier(name),
+                    operator: sqlparser::ast::FunctionArgOperator::Colon,
+                    ..
+                } => name.value.to_ascii_uppercase(),
+                other => panic!("expected preserved named argument, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(argument_names, ["BULK", "FORMAT", "DATA_SOURCE"]);
 
         let mut request = base_request();
         request.dialect = Dialect::Mssql;
         request.sql = sql.to_string();
-        let result = crate::analyzer::analyze(&request);
-        let parse_issue = result
-            .issues
-            .iter()
-            .find(|issue| issue.code == issue_codes::PARSE_ERROR)
-            .expect("invalid option ordering remains a parser diagnostic");
-        assert_eq!(parse_issue.span, Some(Span::new(0, sql.len())));
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(analysis.statements.len(), 1);
+        assert_eq!(
+            analysis.statements[0].span,
+            Some(Span::new(
+                sql.find("SELECT").expect("query start"),
+                sql.len()
+            ))
+        );
+        assert!(
+            !analysis
+                .issues
+                .iter()
+                .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+            "accepted option ordering must preserve analysis source spans: {:?}",
+            analysis.issues
+        );
+
+        for malformed in [
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', DATA_SOURCE = 'lake') AS r",
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 'lake', DATA_SOURCE = 'lake2') AS r",
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 'lake', FORMAT = 'CSV') AS r",
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', DATA_SOURCE = 'lake', FORMAT = 'PARQUET', DATA_SOURCE = 'lake2') AS r",
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 1) AS r",
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 'lake', UNKNOWN = 'x') AS r",
+        ] {
+            assert!(
+                mssql_openrowset_compatible_sql(malformed).is_none(),
+                "malformed options must not use the compatibility adapter: {malformed}"
+            );
+            assert!(
+                parse_input_sql_with_dialect_output(malformed, Dialect::Mssql).is_err(),
+                "malformed options must remain parser errors: {malformed}"
+            );
+        }
+        let malformed = "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 1) AS r";
+        let error = parse_input_sql_with_dialect_output(malformed, Dialect::Mssql)
+            .err()
+            .expect("invalid DATA_SOURCE value must remain an error");
+        assert!(error.position.is_some());
 
         assert_eq!(
             parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
@@ -3022,7 +3080,7 @@ mod tests {
         let sql = concat!(
             "-- café\r\n",
             "SELECT src.c FROM OPENROWSET(",
-            "BULK ('data/a.csv'), FORMAT = 'CSV'",
+            "BULK ('data/a.csv'), FORMAT = 'CSV', DATA_SOURCE = 'lake'",
             ") WITH (c VARCHAR(20) COLLATE Latin1_General_100_BIN2_UTF8) AS src"
         );
         let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
@@ -4408,6 +4466,92 @@ mod tests {
                 "external metadata recognition must remain MSSQL-only"
             );
         }
+    }
+
+    #[test]
+    fn collects_single_statement_guarded_file_formats_without_begin_end() {
+        let sql_cases = [
+            concat!(
+                "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
+                "WHERE name = 'demo_parquet') CREATE EXTERNAL FILE FORMAT ",
+                "demo_parquet WITH (FORMAT_TYPE = PARQUET)"
+            ),
+            concat!(
+                "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
+                "WHERE name = 'demo_text') CREATE EXTERNAL FILE FORMAT ",
+                "demo_text WITH (FORMAT_TYPE = DELIMITEDTEXT, ",
+                "FORMAT_OPTIONS (FIELD_TERMINATOR = ','));"
+            ),
+        ];
+
+        for sql in sql_cases {
+            let parse_only =
+                crate::analyzer::parse_only_sql_with_dialect_output(sql, Dialect::Mssql)
+                    .expect("parse-only single-statement guarded file format");
+            assert_eq!(parse_only.statement_count, 1);
+
+            let mut request = base_request();
+            request.dialect = Dialect::Mssql;
+            request.sql = sql.to_string();
+            let analysis = crate::analyzer::analyze(&request);
+            let statement_end = sql.strip_suffix(';').map_or(sql.len(), str::len);
+            let expected_span = Span::new(0, statement_end);
+
+            assert_eq!(analysis.statements.len(), 1);
+            assert_eq!(
+                analysis.statements[0].statement_type,
+                "CREATE_EXTERNAL_FILE_FORMAT"
+            );
+            assert_eq!(analysis.statements[0].span, Some(expected_span));
+            assert!(analysis.nodes.is_empty());
+            assert!(analysis.edges.is_empty());
+            assert!(analysis.issues.iter().any(|issue| {
+                issue.code == issue_codes::UNSUPPORTED_SYNTAX
+                    && issue
+                        .message
+                        .contains("external-file lineage is not modeled")
+                    && issue.span == Some(expected_span)
+            }));
+            assert!(
+                !analysis
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+                "valid guarded metadata must parse as one full-span statement: {:?}",
+                analysis.issues
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_file_format_else_is_not_swallowed_as_metadata() {
+        let sql = concat!(
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
+            "WHERE name = 'demo_format') CREATE EXTERNAL FILE FORMAT demo_format ",
+            "WITH (FORMAT_TYPE = PARQUET); ELSE SELECT 1"
+        );
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_string();
+
+        let (statements, issues) = collect_statements(&request);
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(
+            statements[0].statement,
+            StatementInputKind::ExternalMetadata(ExternalMetadataStatement::ConditionalFileFormat(
+                _
+            ))
+        ));
+        assert!(
+            !sql[statements[0].source_range.clone()].contains("ELSE"),
+            "the unsupported ELSE branch must not be included in metadata"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+            "an ELSE branch must remain visible as an error instead of being swallowed: {issues:?}"
+        );
     }
 
     #[test]

@@ -257,3 +257,35 @@ fn analyze_sql_json_accepts_semicolon_optional_batch_boundaries() {
     assert_eq!(result["statements"].as_array().unwrap().len(), 2);
     assert!(!has_issue(&result, "PARSE_ERROR"));
 }
+
+#[test]
+fn analyze_sql_json_accepts_bare_if_file_format_metadata() {
+    let result = analyze_mssql(
+        "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET)",
+    );
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+    assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+    assert!(result["nodes"].as_array().unwrap().is_empty());
+    assert!(result["edges"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn analyze_sql_json_accepts_data_source_after_format() {
+    let result = analyze_mssql(
+        "SELECT src.id FROM OPENROWSET(BULK ('data/a.parquet'), FORMAT = 'PARQUET', DATA_SOURCE = 'demo_storage') WITH (id INT) AS src",
+    );
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+    assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+}
+
+#[test]
+fn analyze_sql_json_accepts_nonreserved_trim_identifier() {
+    let result = analyze_mssql("SELECT 1 WHERE TRIM = 'demo'");
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+}
