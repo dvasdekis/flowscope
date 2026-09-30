@@ -335,7 +335,9 @@ pub(crate) fn parse_input_statement_with_dialect_output(
                         validate_cetas_query(sql, cetas, dialect)
                             .map_err(InputParseError::ExternalMetadata)?
                     }
-                    ExternalMetadataStatement::FileFormat(_) => false,
+                    ExternalMetadataStatement::FileFormat(_)
+                    | ExternalMetadataStatement::ConditionalFileFormat(_)
+                    | ExternalMetadataStatement::ExternalTable(_) => false,
                 };
                 return Ok(InputParseOutput::ExternalMetadata(
                     metadata,
@@ -411,7 +413,7 @@ fn is_select_query_body(body: &SetExpr) -> bool {
     }
 }
 
-fn offset_to_position(sql: &str, offset: usize) -> Option<Position> {
+pub(crate) fn offset_to_position(sql: &str, offset: usize) -> Option<Position> {
     let prefix = sql.get(..offset)?;
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let current_line = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
@@ -673,10 +675,13 @@ fn mssql_synapse_openrowset_schema_columns(
     };
     if statements.next().is_some()
         || create.columns.len() != definitions.len()
-        || create
-            .columns
-            .iter()
-            .any(|column| !column.options.is_empty())
+        || create.columns.iter().any(|column| {
+            column
+                .options
+                .as_slice()
+                .iter()
+                .any(|option| !matches!(&option.option, sqlparser::ast::ColumnOption::Collation(_)))
+        })
     {
         return None;
     }
@@ -1409,7 +1414,8 @@ fn parse_full_sql_buffer<'a>(
     statement_ranges: &[Range<usize>],
 ) -> Result<Vec<StatementInput<'a>>, Option<RangeAlignmentError>> {
     if matches!(ctx.dialect, Dialect::Mssql)
-        && statement_ranges_contain_external_metadata(&ctx.source_sql, statement_ranges)
+        && (statement_ranges_contain_external_metadata(&ctx.source_sql, statement_ranges)
+            || mssql_ranges_have_optional_separators(&ctx.source_sql, statement_ranges))
     {
         return Err(None);
     }
@@ -1815,7 +1821,8 @@ fn compute_statement_ranges_for_dialect(
 
 pub(crate) fn mssql_statement_ranges_without_go(sql: &str) -> Result<Vec<Range<usize>>, ()> {
     let ranges = compute_statement_ranges_mssql(sql, 0, 0, MAX_MSSQL_EXPANDED_STATEMENT_RANGES)?;
-    Ok(merge_mssql_block_ranges(sql, ranges, &[]))
+    let block_ranges = merge_mssql_block_ranges(sql, ranges, &[]);
+    split_mssql_optional_statement_ranges(sql, block_ranges, MAX_MSSQL_EXPANDED_STATEMENT_RANGES)
 }
 
 pub(crate) fn statement_ranges_contain_external_metadata(
@@ -1847,7 +1854,214 @@ fn compute_statement_ranges_for_dialect_with_limit(
     } else {
         split_ranges_on_mssql_go_separators(sql, &separators, max_ranges)?
     };
-    Ok(merge_mssql_block_ranges(sql, batch_ranges, &go_ranges))
+    let block_ranges = merge_mssql_block_ranges(sql, batch_ranges, &go_ranges);
+    split_mssql_optional_statement_ranges(sql, block_ranges, max_ranges)
+}
+
+fn split_mssql_optional_statement_ranges(
+    sql: &str,
+    ranges: Vec<Range<usize>>,
+    max_ranges: usize,
+) -> Result<Vec<Range<usize>>, ()> {
+    let mut split_ranges = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let statement_sql = sql.get(range.clone()).ok_or(())?;
+        let Ok(tokens) = Tokenizer::new(&MsSqlDialect {}, statement_sql).tokenize_with_location()
+        else {
+            push_statement_range(&mut split_ranges, sql, range.start, range.end);
+            continue;
+        };
+
+        let mut current_start = 0usize;
+        let mut previous_significant = None;
+        let mut block_depth = 0usize;
+        let mut case_depth = 0usize;
+        let mut parenthesis_depth = 0usize;
+        for (index, token) in tokens.iter().enumerate() {
+            if matches!(token.token, Token::LParen) {
+                parenthesis_depth += 1;
+                previous_significant = Some(index);
+                continue;
+            }
+            if matches!(token.token, Token::RParen) {
+                parenthesis_depth = parenthesis_depth.saturating_sub(1);
+                previous_significant = Some(index);
+                continue;
+            }
+            let Token::Word(word) = &token.token else {
+                if !matches!(token.token, Token::Whitespace(_)) {
+                    previous_significant = Some(index);
+                }
+                continue;
+            };
+            if word.quote_style.is_some() {
+                previous_significant = Some(index);
+                continue;
+            }
+
+            if block_depth == 0
+                && parenthesis_depth == 0
+                && is_mssql_optional_statement_start(&word.value)
+                && previous_significant.is_some_and(|previous| {
+                    token.span.start.line > tokens[previous].span.end.line
+                        && mssql_token_can_end_statement(&tokens[previous].token)
+                })
+            {
+                if let Some(local_range) = mssql_token_byte_range(statement_sql, token) {
+                    let prefix = statement_sql
+                        .get(current_start..local_range.start)
+                        .ok_or(())?;
+                    if mssql_fragment_is_one_statement(prefix) {
+                        push_statement_range(
+                            &mut split_ranges,
+                            sql,
+                            range.start + current_start,
+                            range.start + local_range.start,
+                        );
+                        current_start = local_range.start;
+                        if split_ranges.len() > max_ranges {
+                            return Err(());
+                        }
+                    }
+                }
+            }
+
+            if word.value.eq_ignore_ascii_case("CASE") {
+                case_depth += 1;
+            } else if word.value.eq_ignore_ascii_case("END") {
+                if case_depth > 0 {
+                    case_depth -= 1;
+                } else if !mssql_word_follows(&tokens, index, "CONVERSATION") {
+                    block_depth = block_depth.saturating_sub(1);
+                }
+            } else if word.value.eq_ignore_ascii_case("BEGIN")
+                && !mssql_word_follows_any(
+                    &tokens,
+                    index,
+                    &[
+                        "TRAN",
+                        "TRANSACTION",
+                        "DIALOG",
+                        "DISTRIBUTED",
+                        "CONVERSATION",
+                    ],
+                )
+            {
+                block_depth += 1;
+            }
+            previous_significant = Some(index);
+        }
+        push_statement_range(
+            &mut split_ranges,
+            sql,
+            range.start + current_start,
+            range.end,
+        );
+        if split_ranges.len() > max_ranges {
+            return Err(());
+        }
+    }
+    Ok(split_ranges)
+}
+
+fn mssql_token_can_end_statement(token: &Token) -> bool {
+    match token {
+        Token::Word(word) if word.quote_style.is_none() => ![
+            "AND",
+            "AS",
+            "BETWEEN",
+            "BY",
+            "CASE",
+            "ELSE",
+            "EXCEPT",
+            "FROM",
+            "GROUP",
+            "HAVING",
+            "IN",
+            "INTERSECT",
+            "IS",
+            "JOIN",
+            "LIKE",
+            "NOT",
+            "ON",
+            "OR",
+            "ORDER",
+            "SELECT",
+            "THEN",
+            "UNION",
+            "VALUES",
+            "WHEN",
+            "WHERE",
+            "WITH",
+        ]
+        .iter()
+        .any(|keyword| word.value.eq_ignore_ascii_case(keyword)),
+        Token::Word(_)
+        | Token::Number(_, _)
+        | Token::SingleQuotedString(_)
+        | Token::NationalStringLiteral(_)
+        | Token::RParen
+        | Token::SemiColon => true,
+        _ => false,
+    }
+}
+
+fn is_mssql_optional_statement_start(word: &str) -> bool {
+    [
+        "ALTER",
+        "BACKUP",
+        "BEGIN",
+        "CREATE",
+        "DECLARE",
+        "DELETE",
+        "DROP",
+        "EXEC",
+        "EXECUTE",
+        "GRANT",
+        "IF",
+        "INSERT",
+        "MERGE",
+        "PRINT",
+        "RAISERROR",
+        "RESTORE",
+        "RETURN",
+        "REVOKE",
+        "SELECT",
+        "SET",
+        "THROW",
+        "TRUNCATE",
+        "UPDATE",
+        "USE",
+        "WHILE",
+    ]
+    .iter()
+    .any(|keyword| word.eq_ignore_ascii_case(keyword))
+}
+
+fn mssql_fragment_is_one_statement(sql: &str) -> bool {
+    match parse_input_statement_with_dialect_output(sql, Dialect::Mssql) {
+        Ok(InputParseOutput::ParsedSql(output)) => output.statements.len() == 1,
+        Ok(InputParseOutput::ExternalMetadata(_, _)) => true,
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn mssql_ranges_have_optional_separators(sql: &str, ranges: &[Range<usize>]) -> bool {
+    ranges.windows(2).any(|pair| {
+        let Some(gap) = sql.get(pair[0].end..pair[1].start) else {
+            return false;
+        };
+        if !gap.contains(['\n', '\r']) {
+            return false;
+        }
+        Tokenizer::new(&MsSqlDialect {}, gap)
+            .tokenize_with_location()
+            .is_ok_and(|tokens| {
+                tokens
+                    .iter()
+                    .all(|token| matches!(token.token, Token::Whitespace(_)))
+            })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -2804,6 +3018,86 @@ mod tests {
     }
 
     #[test]
+    fn mssql_openrowset_schema_collation_preserves_the_declared_type_and_source_range() {
+        let sql = concat!(
+            "-- café\r\n",
+            "SELECT src.c FROM OPENROWSET(",
+            "BULK ('data/a.csv'), FORMAT = 'CSV'",
+            ") WITH (c VARCHAR(20) COLLATE Latin1_General_100_BIN2_UTF8) AS src"
+        );
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("documented schema collation should be accepted");
+        assert!(output.parser_fallback_used);
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        let TableFactor::Table {
+            alias: Some(alias), ..
+        } = &select.from[0].relation
+        else {
+            panic!("expected OPENROWSET table factor");
+        };
+        assert_eq!(alias.columns.len(), 1);
+        assert_eq!(alias.columns[0].name.value, "c");
+        assert_eq!(
+            alias.columns[0]
+                .data_type
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("VARCHAR(20)"),
+            "the declared data type must survive the collation adapter"
+        );
+
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql)
+            .expect("valid MSSQL source ranges");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            &sql[ranges[0].clone()],
+            sql.trim_start_matches("-- café\r\n")
+        );
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(analysis.statements.len(), 1);
+        assert_eq!(
+            analysis.statements[0].span,
+            Some(Span::new(
+                sql.find("SELECT").expect("query start"),
+                sql.len()
+            )),
+            "schema adaptation must retain original UTF-8 source spans"
+        );
+        assert!(
+            !analysis.issues.iter().any(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            }),
+            "valid collation syntax must not report a parse error: {:?}",
+            analysis.issues
+        );
+
+        let malformed = concat!(
+            "SELECT src.c FROM OPENROWSET(BULK 'data/a.csv', FORMAT = 'CSV') ",
+            "WITH (c VARCHAR(20) COLLATE) AS src"
+        );
+        assert!(
+            parse_input_sql_with_dialect_output(malformed, Dialect::Mssql).is_err(),
+            "a missing collation name must remain invalid"
+        );
+        assert_eq!(
+            parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            parse_input_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            "the collation adapter must remain MSSQL-only"
+        );
+    }
+
+    #[test]
     fn mssql_synapse_openrowset_supports_parenthesized_bulk_file_lists() {
         let sql = concat!(
             "-- café\r\n",
@@ -3591,6 +3885,142 @@ mod tests {
     }
 
     #[test]
+    fn mssql_statement_ranges_recognize_optional_newline_separators() {
+        let sql = "-- café\r\nEXEC dbo.demo_proc\r\nDROP VIEW dbo.demo_view";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql)
+            .expect("bounded MSSQL ranges");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(&sql[ranges[0].clone()], "EXEC dbo.demo_proc");
+        assert_eq!(&sql[ranges[1].clone()], "DROP VIEW dbo.demo_view");
+
+        let block = "BEGIN SELECT 1; END\nSET NOCOUNT ON";
+        let ranges = compute_statement_ranges_for_dialect(block, Dialect::Mssql)
+            .expect("bounded MSSQL block ranges");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(&block[ranges[0].clone()], "BEGIN SELECT 1; END");
+        assert_eq!(&block[ranges[1].clone()], "SET NOCOUNT ON");
+
+        let comments_and_strings = concat!(
+            "EXEC dbo.demo_proc @value = N'DROP VIEW fake_view'\n",
+            "-- DROP VIEW in a comment\n",
+            "DROP VIEW dbo.demo_view"
+        );
+        let ranges = compute_statement_ranges_for_dialect(comments_and_strings, Dialect::Mssql)
+            .expect("comments and string contents must not become boundaries");
+        assert_eq!(ranges.len(), 2);
+        assert!(comments_and_strings[ranges[0].clone()].contains("N'DROP VIEW fake_view'"));
+        assert_eq!(
+            &comments_and_strings[ranges[1].clone()],
+            "DROP VIEW dbo.demo_view"
+        );
+
+        let continuation = "SELECT 1\nFROM dbo.demo_table";
+        assert_eq!(
+            compute_statement_ranges_for_dialect(continuation, Dialect::Mssql)
+                .expect("SELECT continuation")
+                .len(),
+            1,
+            "a clause continuation must not be split as a new statement"
+        );
+        for query in [
+            "SELECT 1\nUNION\nSELECT 2",
+            "SELECT * FROM (\nSELECT 1\n) AS nested_query",
+        ] {
+            assert_eq!(
+                compute_statement_ranges_for_dialect(query, Dialect::Mssql)
+                    .expect("query continuation")
+                    .len(),
+                1,
+                "query clauses and nested queries must not be split: {query}"
+            );
+        }
+        assert_eq!(
+            compute_statement_ranges_for_dialect(sql, Dialect::Generic)
+                .expect("generic dialect keeps its existing splitting")
+                .len(),
+            1,
+            "optional T-SQL separators must not affect other dialects"
+        );
+    }
+
+    #[test]
+    fn mssql_optional_statement_recovery_does_not_hide_malformed_fragments() {
+        let sql = "EXEC dbo.demo_proc\nDROP VIEW dbo.demo_view EXTRA";
+        let parse_error = crate::analyzer::parse_only_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect_err("parse-only must not recover malformed newline-separated fragments");
+        assert_eq!(
+            parse_error.position.map(|position| position.line),
+            Some(2),
+            "parse-only diagnostics must map back to the original source line"
+        );
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+
+        let (statements, issues) = collect_statements(&request);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            &sql[statements[0].source_range.clone()],
+            "EXEC dbo.demo_proc"
+        );
+        let parse_error = issues
+            .iter()
+            .find(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            })
+            .expect("malformed DROP fragment must remain a parse error");
+        let error_span = parse_error.span.expect("malformed fragment span");
+        assert_eq!(
+            &sql[error_span.start..error_span.end],
+            "DROP VIEW dbo.demo_view EXTRA"
+        );
+    }
+
+    #[test]
+    fn mssql_optional_separator_batches_parse_each_statement_with_original_ranges() {
+        for sql in [
+            "-- café\r\nEXEC dbo.demo_proc\r\nDROP VIEW dbo.demo_view",
+            "SELECT 1\nSET NOCOUNT ON",
+            "BEGIN SELECT 1; END\nSET NOCOUNT ON",
+            "WHILE 1 = 0 BEGIN SELECT 1; END\nSET NOCOUNT ON",
+        ] {
+            let parse_only =
+                crate::analyzer::parse_only_sql_with_dialect_output(sql, Dialect::Mssql)
+                    .expect("parse-only semicolon-optional batch");
+            assert_eq!(
+                parse_only.statement_count, 2,
+                "parse-only statement count must follow T-SQL boundaries"
+            );
+
+            let mut request = base_request();
+            request.dialect = Dialect::Mssql;
+            request.sql = sql.to_owned();
+
+            let (statements, issues) = collect_statements(&request);
+            assert_eq!(statements.len(), 2, "unexpected statements: {issues:?}");
+            assert!(
+                !issues.iter().any(|issue| {
+                    issue.code == issue_codes::PARSE_ERROR
+                        && issue.severity == crate::types::Severity::Error
+                }),
+                "valid semicolon-optional statements must parse: {issues:?}"
+            );
+            let expected: Vec<_> = compute_statement_ranges_for_dialect(sql, Dialect::Mssql)
+                .expect("validated MSSQL source ranges")
+                .into_iter()
+                .map(|range| sql[range].to_owned())
+                .collect();
+            let actual: Vec<_> = statements
+                .iter()
+                .map(|statement| statement.source_sql[statement.source_range.clone()].to_owned())
+                .collect();
+            assert_eq!(actual, expected, "statement order and byte spans changed");
+        }
+    }
+
+    #[test]
     fn mssql_repeat_expansion_has_a_global_range_budget() {
         let mut sql = String::new();
         for _ in 0..=MAX_MSSQL_EXPANDED_STATEMENT_RANGES / MAX_MSSQL_GO_REPEAT {
@@ -3886,6 +4316,98 @@ mod tests {
         assert_eq!(statements[0].source_sql.as_ref(), sql);
         assert!(statements[0].source_sql[statements[0].source_range.clone()]
             .contains("FIELD_TERMINATOR"));
+    }
+
+    #[test]
+    fn collects_external_table_and_guarded_file_format_as_metadata_only_inputs() {
+        let table_sql = concat!(
+            "-- café\r\n",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT, label VARCHAR(20)) ",
+            "WITH (LOCATION = 'data/', DATA_SOURCE = demo_storage, ",
+            "FILE_FORMAT = demo_parquet)\r\n",
+            "SELECT 1"
+        );
+        let parse_only = crate::analyzer::parse_only_sql_with_dialect_output(
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT, label VARCHAR(20)) \
+             WITH (LOCATION = 'data/', DATA_SOURCE = demo_storage, \
+             FILE_FORMAT = demo_parquet)",
+            Dialect::Mssql,
+        )
+        .expect("parse-only external table");
+        assert_eq!(parse_only.statement_count, 1);
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = table_sql.to_owned();
+        let (statements, issues) = collect_statements(&request);
+        assert_eq!(statements.len(), 2, "{issues:?}");
+        assert!(matches!(
+            statements[0].statement,
+            StatementInputKind::ExternalMetadata(ExternalMetadataStatement::ExternalTable(_))
+        ));
+        assert_eq!(
+            &table_sql[statements[0].source_range.clone()],
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT, label VARCHAR(20)) \
+             WITH (LOCATION = 'data/', DATA_SOURCE = demo_storage, \
+             FILE_FORMAT = demo_parquet)"
+        );
+        assert_eq!(&table_sql[statements[1].source_range.clone()], "SELECT 1");
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+            "valid external-table DDL must not report a parse error: {issues:?}"
+        );
+
+        let conditional_sql = concat!(
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
+            "WHERE name = 'demo_format') BEGIN ",
+            "CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); ",
+            "END"
+        );
+        let parse_only =
+            crate::analyzer::parse_only_sql_with_dialect_output(conditional_sql, Dialect::Mssql)
+                .expect("parse-only guarded external file format");
+        assert_eq!(parse_only.statement_count, 1);
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = conditional_sql.to_owned();
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(analysis.statements.len(), 1);
+        assert_eq!(
+            analysis.statements[0].statement_type,
+            "CREATE_EXTERNAL_FILE_FORMAT"
+        );
+        assert_eq!(
+            analysis.statements[0].span,
+            Some(Span::new(0, conditional_sql.len()))
+        );
+        assert!(analysis.nodes.is_empty());
+        assert!(analysis.edges.is_empty());
+        assert!(analysis.issues.iter().any(|issue| {
+            issue.code == issue_codes::UNSUPPORTED_SYNTAX
+                && issue
+                    .message
+                    .contains("external-file lineage is not modeled")
+                && issue.span == Some(Span::new(0, conditional_sql.len()))
+        }));
+        assert!(
+            !analysis
+                .issues
+                .iter()
+                .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+            "the complete conditional must be parsed, not skipped: {:?}",
+            analysis.issues
+        );
+
+        for sql in [table_sql, conditional_sql] {
+            assert_eq!(
+                parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+                parse_input_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+                "external metadata recognition must remain MSSQL-only"
+            );
+        }
     }
 
     #[test]

@@ -11,11 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added synthetic regressions for MSSQL `CREATE OR ALTER VIEW`, multiple Synapse `OPENROWSET` sources, `DELTA` format, and CSV `ROWSET_OPTIONS`.
 - Added narrow Synapse CETAS parsing for optional name-only output-column lists, `LOCATION`, `DATA_SOURCE`, and `FILE_FORMAT` followed by one `SELECT`; typed column definitions remain unsupported, and analysis emits an explicit unsupported-lineage warning without creating table or file-write lineage.
+- Added metadata-only parsing for typed Synapse `CREATE EXTERNAL TABLE ... WITH (LOCATION, DATA_SOURCE, FILE_FORMAT)` without `AS SELECT`, plus a bounded `IF NOT EXISTS (SELECT ...) BEGIN CREATE EXTERNAL FILE FORMAT ... END` form that validates the condition and block rather than skipping control flow.
 - Confirmed and regression-tested Synapse `OPENROWSET` option ordering: `DATA_SOURCE` precedes `FORMAT`; the reversed order remains rejected.
 
 ### Fixed
 
 - Added MSSQL-only parsing support for documented Synapse `OPENROWSET(BULK ('path1', 'path2'), ...)` file lists, with malformed lists rejected and original source offsets preserved.
+- Accepted declared-column `COLLATE` on Synapse `OPENROWSET` while preserving the parsed data type and source offsets.
+- Split supported semicolon-optional MSSQL statements—including `EXEC`/`DROP VIEW`, `BEGIN`/`SET`, and `WHILE`/`SET` batches—at validated top-level newline boundaries without changing other dialects or recovering malformed fragments as valid statements.
 
 ## [0.9.5] - 2026-09-27
 

@@ -191,3 +191,26 @@ fn cli_accepts_inline_tvf_cte_without_outer_parentheses() {
     assert_eq!(result["statements"][0]["span"]["end"], sql.len());
     assert!(!has_issue(&result, "PARSE_ERROR"));
 }
+
+#[test]
+fn cli_accepts_measured_external_metadata_and_batch_shapes() {
+    for (sql, count) in [
+        (
+            "CREATE EXTERNAL TABLE dbo.demo_rows (id INT, label VARCHAR(20)) WITH (LOCATION = 'data/', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet)",
+            1,
+        ),
+        (
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') BEGIN CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); END",
+            1,
+        ),
+        (
+            "SELECT src.label FROM OPENROWSET(BULK ('data/a.csv'), FORMAT = 'CSV') WITH (label VARCHAR(20) COLLATE Latin1_General_100_BIN2_UTF8) AS src",
+            1,
+        ),
+        ("SELECT 1\nSET NOCOUNT ON", 2),
+    ] {
+        let result = analyze_mssql(sql);
+        assert_eq!(result["statements"].as_array().unwrap().len(), count);
+        assert!(!has_issue(&result, "PARSE_ERROR"));
+    }
+}

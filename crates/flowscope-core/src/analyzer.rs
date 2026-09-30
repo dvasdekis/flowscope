@@ -101,12 +101,20 @@ pub struct ParseOnlyOutput {
 
 /// Parse SQL with the same input adapters used by analysis, without running analysis or lint.
 ///
-/// Valid MSSQL `CREATE EXTERNAL FILE FORMAT` and supported CETAS statements each
-/// contribute one to `statement_count`, even though they do not produce a SQL AST node.
+/// Supported MSSQL external metadata statements each contribute one to
+/// `statement_count`, even though they do not produce a SQL AST node.
 pub fn parse_only_sql_with_dialect_output(
     sql: &str,
     dialect: Dialect,
 ) -> Result<ParseOnlyOutput, ParseError> {
+    if matches!(dialect, Dialect::Mssql) {
+        if let Ok(statement_ranges) = input::mssql_statement_ranges_without_go(sql) {
+            if input::mssql_ranges_have_optional_separators(sql, &statement_ranges) {
+                return parse_only_statement_ranges(sql, statement_ranges, dialect);
+            }
+        }
+    }
+
     match input::parse_input_statement_with_dialect_output(sql, dialect) {
         Ok(output) => Ok(parse_only_output_summary(output)),
         Err(error) => {
@@ -122,32 +130,70 @@ pub fn parse_only_sql_with_dialect_output(
                 return Err(primary_error);
             }
 
-            let mut summary = ParseOnlyOutput {
-                statement_count: 0,
-                parser_fallback_used: false,
-            };
-            let mut first_error = None;
-            for range in statement_ranges {
-                let Some(statement_sql) = sql.get(range) else {
-                    return Err(primary_error);
-                };
-                match input::parse_input_statement_with_dialect_output(statement_sql, dialect) {
-                    Ok(output) => {
-                        let next = parse_only_output_summary(output);
-                        summary.statement_count += next.statement_count;
-                        summary.parser_fallback_used |= next.parser_fallback_used;
-                    }
-                    Err(error) => {
-                        if first_error.is_none() {
-                            first_error = Some(error.into_parse_error());
-                        }
-                    }
-                }
-            }
-
-            first_error.map_or(Ok(summary), Err)
+            parse_only_statement_ranges(sql, statement_ranges, dialect)
         }
     }
+}
+
+fn parse_only_statement_ranges(
+    sql: &str,
+    statement_ranges: Vec<std::ops::Range<usize>>,
+    dialect: Dialect,
+) -> Result<ParseOnlyOutput, ParseError> {
+    let mut summary = ParseOnlyOutput {
+        statement_count: 0,
+        parser_fallback_used: false,
+    };
+    let mut first_error = None;
+    for range in statement_ranges {
+        let statement_sql = sql.get(range.clone()).ok_or_else(|| {
+            ParseError::new("Could not read MSSQL statement source range")
+                .with_dialect(dialect)
+                .with_kind(crate::error::ParseErrorKind::SyntaxError)
+        })?;
+        match input::parse_input_statement_with_dialect_output(statement_sql, dialect) {
+            Ok(output) => {
+                let next = parse_only_output_summary(output);
+                summary.statement_count += next.statement_count;
+                summary.parser_fallback_used |= next.parser_fallback_used;
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(map_parse_error_from_statement_range(
+                        sql,
+                        statement_sql,
+                        range.start,
+                        error.into_parse_error(),
+                    ));
+                }
+            }
+        }
+    }
+
+    first_error.map_or(Ok(summary), Err)
+}
+
+fn map_parse_error_from_statement_range(
+    source_sql: &str,
+    statement_sql: &str,
+    statement_offset: usize,
+    mut error: ParseError,
+) -> ParseError {
+    if let Some(position) = error.position {
+        if let Some(relative_offset) =
+            helpers::line_col_to_offset(statement_sql, position.line, position.column)
+        {
+            if let Some(source_position) =
+                input::offset_to_position(source_sql, statement_offset + relative_offset)
+            {
+                error.position = Some(source_position);
+                if let Some(message_position) = error.message.rfind(" at Line:") {
+                    error.message.truncate(message_position);
+                }
+            }
+        }
+    }
+    error
 }
 
 fn parse_only_output_summary(output: input::InputParseOutput) -> ParseOnlyOutput {

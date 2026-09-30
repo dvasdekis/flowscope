@@ -212,3 +212,48 @@ fn analyze_sql_json_accepts_inline_tvf_cte_without_outer_parentheses() {
     assert_eq!(result["statements"][0]["span"]["end"], sql.len());
     assert!(!has_issue(&result, "PARSE_ERROR"));
 }
+
+#[test]
+fn analyze_sql_json_accepts_external_table_metadata_without_lineage() {
+    let result = analyze_mssql(
+        "CREATE EXTERNAL TABLE dbo.demo_rows (id INT, label VARCHAR(20)) WITH (LOCATION = 'data/', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet)",
+    );
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+    assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+    assert!(result["nodes"].as_array().unwrap().is_empty());
+    assert!(result["edges"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn analyze_sql_json_accepts_guarded_file_format_metadata() {
+    let result = analyze_mssql(
+        "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') BEGIN CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET); END",
+    );
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+    assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+    assert!(result["nodes"].as_array().unwrap().is_empty());
+    assert!(result["edges"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn analyze_sql_json_accepts_openrowset_column_collation() {
+    let result = analyze_mssql(
+        "SELECT src.label FROM OPENROWSET(BULK ('data/a.csv'), FORMAT = 'CSV') WITH (label VARCHAR(20) COLLATE Latin1_General_100_BIN2_UTF8) AS src",
+    );
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+    assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+}
+
+#[test]
+fn analyze_sql_json_accepts_semicolon_optional_batch_boundaries() {
+    let result = analyze_mssql("SELECT 1\nSET NOCOUNT ON");
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 2);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+}
