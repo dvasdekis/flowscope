@@ -30,6 +30,24 @@ const MAX_MSSQL_GO_SEPARATORS: usize = 100_000;
 /// Repeated MSSQL batches are expanded for analysis, but the count is bounded to avoid
 /// untrusted `GO n` lines multiplying work without limit.
 pub(super) const MAX_MSSQL_GO_REPEAT: usize = 1_000;
+const MSSQL_SYNAPSE_OPENROWSET_OPTIONS: &[&str] = &[
+    "CODEPAGE",
+    "DATA_COMPRESSION",
+    "DATA_SOURCE",
+    "DATAFILETYPE",
+    "ERRORFILE_DATA_SOURCE",
+    "ERRORFILE_LOCATION",
+    "ESCAPECHAR",
+    "FIELDQUOTE",
+    "FIELDTERMINATOR",
+    "FIRSTROW",
+    "FORMAT",
+    "HEADER_ROW",
+    "MAXERRORS",
+    "PARSER_VERSION",
+    "ROWSET_OPTIONS",
+    "ROWTERMINATOR",
+];
 
 #[derive(Clone, Copy)]
 enum AnalysisSource<'a> {
@@ -236,15 +254,37 @@ fn parse_input_sql_with_dialect_output(
     dialect: Dialect,
 ) -> Result<ParseSqlOutput, ParseError> {
     let original = parse_sql_with_dialect_output(sql, dialect);
-    if original.is_ok() || !matches!(dialect, Dialect::Mssql) {
+    if !matches!(dialect, Dialect::Mssql)
+        || !mssql_source_contains_ascii_case_insensitive(sql, b"OPENROWSET")
+    {
         return original;
+    }
+
+    if original.is_ok() {
+        if let Some(position) = mssql_parenthesized_bulk_syntax_error(sql) {
+            return Err(ParseError::with_position(
+                "Malformed or unsupported Synapse OPENROWSET BULK file-list syntax",
+                position.line,
+                position.column,
+            )
+            .with_dialect(dialect));
+        }
     }
 
     let Some(compatibility) = mssql_openrowset_compatibility(sql) else {
         return original;
     };
 
-    let mut output = parse_sql_with_dialect_output(&compatibility.sql, dialect)?;
+    let mut output = match parse_sql_with_dialect_output(&compatibility.sql, dialect) {
+        Ok(output) => output,
+        Err(error) => {
+            return if original.is_ok() {
+                original
+            } else {
+                Err(error)
+            };
+        }
+    };
     if !compatibility.schemas.is_empty()
         && !mssql_apply_openrowset_schema_columns(
             sql,
@@ -256,6 +296,12 @@ fn parse_input_sql_with_dialect_output(
     }
     output.parser_fallback_used = true;
     Ok(output)
+}
+
+fn mssql_source_contains_ascii_case_insensitive(sql: &str, needle: &[u8]) -> bool {
+    sql.as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 pub(crate) enum InputParseOutput {
@@ -383,26 +429,75 @@ fn mssql_openrowset_compatible_sql(sql: &str) -> Option<String> {
     mssql_openrowset_compatibility(sql).map(|compatibility| compatibility.sql)
 }
 
-fn mssql_openrowset_compatibility(sql: &str) -> Option<MssqlOpenRowsetCompatibility> {
-    const OPTIONS: &[&str] = &[
-        "CODEPAGE",
-        "DATA_COMPRESSION",
-        "DATA_SOURCE",
-        "DATAFILETYPE",
-        "ERRORFILE_DATA_SOURCE",
-        "ERRORFILE_LOCATION",
-        "ESCAPECHAR",
-        "FIELDQUOTE",
-        "FIELDTERMINATOR",
-        "FIRSTROW",
-        "FORMAT",
-        "HEADER_ROW",
-        "MAXERRORS",
-        "PARSER_VERSION",
-        "ROWSET_OPTIONS",
-        "ROWTERMINATOR",
-    ];
+fn mssql_parenthesized_bulk_syntax_error(sql: &str) -> Option<Position> {
+    let tokens = Tokenizer::new(&MsSqlDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    for (index, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if word.quote_style.is_some() || !word.value.eq_ignore_ascii_case("OPENROWSET") {
+            continue;
+        }
+        if !mssql_openrowset_is_table_factor(&tokens, index) {
+            continue;
+        }
 
+        let open_paren = mssql_next_significant_token(&tokens, index + 1)?;
+        if !matches!(tokens[open_paren].token, Token::LParen) {
+            continue;
+        }
+        let Some(close_paren) = mssql_matching_paren(&tokens, open_paren) else {
+            continue;
+        };
+        let Some(argument_ranges) = mssql_openrowset_arguments(&tokens, open_paren, close_paren)
+        else {
+            continue;
+        };
+        let Some(first_argument) = argument_ranges.first() else {
+            continue;
+        };
+        let significant = mssql_significant_token_indices(&tokens, first_argument);
+        let Some(bulk_index) = significant.first().copied() else {
+            continue;
+        };
+        let Token::Word(bulk) = &tokens[bulk_index].token else {
+            continue;
+        };
+        if bulk.quote_style.is_some() || !bulk.value.eq_ignore_ascii_case("BULK") {
+            continue;
+        }
+        let Some(list_index) = significant.get(1).copied() else {
+            continue;
+        };
+        if !matches!(tokens[list_index].token, Token::LParen) {
+            continue;
+        }
+
+        let invalid_arguments = mssql_synapse_openrowset_argument_replacements(
+            sql,
+            &tokens,
+            &argument_ranges,
+            MSSQL_SYNAPSE_OPENROWSET_OPTIONS,
+        )
+        .is_none();
+        let invalid_schema = mssql_openrowset_schema_after_call(
+            sql,
+            &tokens,
+            close_paren,
+            mssql_token_byte_range(sql, token)?.start,
+        )
+        .is_err();
+        if invalid_arguments || invalid_schema {
+            let list_offset = mssql_token_byte_range(sql, &tokens[list_index])?.start;
+            return offset_to_position(sql, list_offset);
+        }
+    }
+    None
+}
+
+fn mssql_openrowset_compatibility(sql: &str) -> Option<MssqlOpenRowsetCompatibility> {
     let tokens = Tokenizer::new(&MsSqlDialect {}, sql)
         .tokenize_with_location()
         .ok()?;
@@ -434,9 +529,12 @@ fn mssql_openrowset_compatibility(sql: &str) -> Option<MssqlOpenRowsetCompatibil
         else {
             continue;
         };
-        let Some(argument_replacements) =
-            mssql_synapse_openrowset_argument_replacements(sql, &tokens, &argument_ranges, OPTIONS)
-        else {
+        let Some(argument_replacements) = mssql_synapse_openrowset_argument_replacements(
+            sql,
+            &tokens,
+            &argument_ranges,
+            MSSQL_SYNAPSE_OPENROWSET_OPTIONS,
+        ) else {
             continue;
         };
 
@@ -932,20 +1030,35 @@ fn mssql_synapse_openrowset_argument_replacements(
     if bulk.quote_style.is_some() || !bulk.value.eq_ignore_ascii_case("BULK") {
         return None;
     }
-    let path_index = *significant.get(1)?;
-    if significant.len() != 2 {
-        return None;
-    }
-    if !matches!(
-        tokens[path_index].token,
-        Token::SingleQuotedString(_) | Token::NationalStringLiteral(_)
-    ) {
+    let bulk_value = &significant[1..];
+    let path_index = *bulk_value.first()?;
+    let path_argument_valid = if bulk_value.len() == 1 {
+        mssql_synapse_bulk_path_is_string(&tokens[path_index].token)
+    } else if matches!(tokens[path_index].token, Token::LParen)
+        && matches!(tokens[*bulk_value.last()?].token, Token::RParen)
+    {
+        let list = &bulk_value[1..bulk_value.len() - 1];
+        if list.is_empty() || list.len() & 1 == 0 {
+            false
+        } else {
+            list.iter().enumerate().all(|(index, token_index)| {
+                if index % 2 == 0 {
+                    mssql_synapse_bulk_path_is_string(&tokens[*token_index].token)
+                } else {
+                    matches!(tokens[*token_index].token, Token::Comma)
+                }
+            })
+        }
+    } else {
+        false
+    };
+    if !path_argument_valid {
         return None;
     }
 
     let bulk_range = mssql_token_byte_range(sql, &tokens[bulk_index])?;
-    let path_range = mssql_token_byte_range(sql, &tokens[path_index])?;
-    let separator = sql.get(bulk_range.end..path_range.start)?;
+    let path_start = mssql_token_byte_range(sql, &tokens[path_index])?.start;
+    let separator = sql.get(bulk_range.end..path_start)?;
     let bulk_separator = separator
         .char_indices()
         .find_map(|(index, ch)| matches!(ch, ' ' | '\t').then_some(bulk_range.end + index))?;
@@ -992,6 +1105,13 @@ fn mssql_synapse_openrowset_argument_replacements(
     }
 
     seen_format.then_some(replacements)
+}
+
+fn mssql_synapse_bulk_path_is_string(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::SingleQuotedString(_) | Token::NationalStringLiteral(_)
+    )
 }
 
 fn mssql_significant_token_indices(tokens: &[TokenWithSpan], range: &Range<usize>) -> Vec<usize> {
@@ -2684,6 +2804,87 @@ mod tests {
     }
 
     #[test]
+    fn mssql_synapse_openrowset_supports_parenthesized_bulk_file_lists() {
+        let sql = concat!(
+            "-- café\r\n",
+            "SELECT src.id FROM OPENROWSET(\r\n",
+            "  BULK (\r\n",
+            "    N'data/a.parquet', /* preserve list comments */ 'data/b.parquet'\r\n",
+            "  ), FORMAT = 'PARQUET'\r\n",
+            ") AS src"
+        );
+        assert!(
+            parse_sql_with_dialect_output(sql, Dialect::Mssql).is_ok(),
+            "the upstream parser accepts this shape as a BULK function call rather than a Synapse argument"
+        );
+
+        let compatible_sql =
+            mssql_openrowset_compatible_sql(sql).expect("recognize a Synapse BULK file list");
+        assert_eq!(compatible_sql.len(), sql.len());
+        assert_eq!(
+            compatible_sql.matches('\n').count(),
+            sql.matches('\n').count()
+        );
+        assert_eq!(
+            compatible_sql.matches('\r').count(),
+            sql.matches('\r').count()
+        );
+        for path in ["N'data/a.parquet'", "'data/b.parquet'"] {
+            let path_start = sql.find(path).expect("path literal");
+            assert_eq!(
+                &compatible_sql[path_start..path_start + path.len()],
+                path,
+                "one-byte rewrites must keep file-list tokens at their original offsets"
+            );
+        }
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse parenthesized Synapse BULK file list");
+        assert!(output.parser_fallback_used);
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        let TableFactor::Table {
+            args: Some(args), ..
+        } = &select.from[0].relation
+        else {
+            panic!("expected OPENROWSET table-valued function");
+        };
+        let Some(sqlparser::ast::FunctionArg::ExprNamed {
+            name: sqlparser::ast::Expr::Identifier(name),
+            operator: sqlparser::ast::FunctionArgOperator::Colon,
+            ..
+        }) = args.args.first()
+        else {
+            panic!("expected adapted BULK argument");
+        };
+        assert_eq!(name.value, "BULK");
+        let bulk_argument = format!("{:?}", args.args[0]);
+        assert!(bulk_argument.contains("data/a.parquet"));
+        assert!(bulk_argument.contains("data/b.parquet"));
+
+        let single_sql =
+            "SELECT src.id FROM OPENROWSET(BULK ('data/single.parquet'), FORMAT = 'PARQUET') AS src";
+        let single_output = parse_input_sql_with_dialect_output(single_sql, Dialect::Mssql)
+            .expect("parse a one-item parenthesized Synapse BULK list");
+        assert!(single_output.parser_fallback_used);
+        assert_eq!(single_output.statements.len(), 1);
+
+        let generic = parse_input_sql_with_dialect_output(sql, Dialect::Generic);
+        assert_eq!(
+            parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            generic.is_ok(),
+            "parenthesized BULK adaptation must remain MSSQL-only"
+        );
+        if let Ok(output) = generic {
+            assert!(!output.parser_fallback_used);
+        }
+    }
+
+    #[test]
     fn mssql_synapse_openrowset_schema_is_preserved_as_alias_columns() {
         let sql = concat!(
             "-- café\r\n",
@@ -2770,6 +2971,13 @@ mod tests {
             "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT DEFAULT 1) AS file",
             "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT 0) AS file",
             "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT,) AS file",
+            "SELECT * FROM OPENROWSET(BULK (), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK ('path',), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK (, 'path'), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK ('path' 'other'), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK (('path'), 'other'), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK ('path', 1), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK ('path', 'other',), FORMAT = 'PARQUET') AS file",
         ] {
             assert!(
                 parse_input_sql_with_dialect_output(sql, Dialect::Mssql).is_err(),

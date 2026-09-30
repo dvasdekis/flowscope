@@ -93,7 +93,7 @@ fn split_statements_json_preserves_ranges_for_repeated_mssql_batches() {
 #[test]
 fn analyze_sql_json_accepts_synapse_openrowset_bulk_source() {
     let result = analyze_mssql(
-        "SELECT file.id FROM OPENROWSET(BULK 'https://storage.example/data/*.parquet', FORMAT = 'PARQUET') WITH (id BIGINT) AS file",
+        "SELECT file.id FROM OPENROWSET(BULK ('https://storage.example/data/a.parquet', 'https://storage.example/data/b.parquet'), FORMAT = 'PARQUET') WITH (id BIGINT) AS file",
     );
     assert_eq!(result["statements"].as_array().unwrap().len(), 1);
     assert!(!has_issue(&result, "PARSE_ERROR"));
@@ -103,6 +103,15 @@ fn analyze_sql_json_accepts_synapse_openrowset_bulk_source() {
         .iter()
         .all(|node| node["type"] != "table"));
     assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+}
+
+#[test]
+fn analyze_sql_json_rejects_a_trailing_comma_in_bulk_file_lists() {
+    let result = analyze_mssql(
+        "SELECT * FROM OPENROWSET(BULK ('data/a.parquet',), FORMAT = 'PARQUET') AS file",
+    );
+
+    assert!(has_issue(&result, "PARSE_ERROR"));
 }
 
 #[test]
@@ -191,4 +200,15 @@ fn analyze_sql_json_rejects_typed_cetas_output_columns() {
     );
 
     assert!(has_issue(&result, "PARSE_ERROR"));
+}
+
+#[test]
+fn analyze_sql_json_accepts_inline_tvf_cte_without_outer_parentheses() {
+    let sql = "CREATE FUNCTION dbo.demo_rows() RETURNS TABLE AS RETURN WITH demo_cte AS (SELECT 1 AS demo_value) SELECT demo_value FROM demo_cte";
+    let result = analyze_mssql(sql);
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert_eq!(result["statements"][0]["span"]["start"], 0);
+    assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+    assert!(!has_issue(&result, "PARSE_ERROR"));
 }

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added narrow Synapse CETAS parsing for optional name-only output-column lists, `LOCATION`, `DATA_SOURCE`, and `FILE_FORMAT` followed by one `SELECT`; typed column definitions remain unsupported, and analysis emits an explicit unsupported-lineage warning without creating table or file-write lineage.
 - Confirmed and regression-tested Synapse `OPENROWSET` option ordering: `DATA_SOURCE` precedes `FORMAT`; the reversed order remains rejected.
 
+### Fixed
+
+- Added MSSQL-only parsing support for documented Synapse `OPENROWSET(BULK ('path1', 'path2'), ...)` file lists, with malformed lists rejected and original source offsets preserved.
+
 ## [0.9.5] - 2026-09-27
 
 ### Fixed

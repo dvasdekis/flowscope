@@ -32,7 +32,7 @@ pub fn parse_sql_with_dialect_output(
             let mut mssql_adapter_error = None;
             if matches!(dialect, Dialect::Mssql) {
                 if let Some(adapted_parse) =
-                    mssql_module::parse_compatible_procedure(sql, sqlparser_dialect.as_ref())
+                    mssql_module::parse_compatible_module(sql, sqlparser_dialect.as_ref())
                 {
                     match adapted_parse {
                         Ok(statements) => {

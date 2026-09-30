@@ -5,21 +5,195 @@ use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Span, Token, TokenWithSpan, Tokenizer, Word};
 use std::ops::Range;
 
-/// Parse the narrow procedure-header variants supported by this adapter.
+/// Parse the narrow MSSQL module variants supported by this adapter.
 ///
 /// The source string is never rewritten; adapted and synthetic tokens retain
 /// their source or boundary locations.
-pub(super) fn parse_compatible_procedure(
+pub(super) fn parse_compatible_module(
     sql: &str,
     dialect: &dyn Dialect,
 ) -> Option<Result<Vec<Statement>, ParserError>> {
     let mut tokens = Tokenizer::new(dialect, sql).tokenize_with_location().ok()?;
-    if !adapt_procedure_headers(&mut tokens) {
+    let procedure_adapted = adapt_procedure_headers(&mut tokens);
+    let function_adapted = adapt_inline_table_function_return(&mut tokens);
+    if !procedure_adapted && !function_adapted {
         return None;
     }
 
     let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
     Some(parser.parse_statements())
+}
+
+fn adapt_inline_table_function_return(tokens: &mut Vec<TokenWithSpan>) -> bool {
+    let significant = significant_token_indices(tokens);
+    let functions = find_inline_table_function_returns(tokens, &significant);
+    if functions.is_empty() {
+        return false;
+    }
+
+    let mut insertions = Vec::with_capacity(functions.len() * 2);
+    for (with_index, statement_end) in functions {
+        if !has_balanced_parentheses(tokens, with_index..statement_end) {
+            continue;
+        }
+        let Some(open_span) = point_span(tokens[with_index].span.start) else {
+            continue;
+        };
+        let boundary = tokens
+            .get(statement_end)
+            .map(|token| token.span.start)
+            .or_else(|| tokens.last().map(|token| token.span.end));
+        let Some(close_span) = boundary.and_then(point_span) else {
+            continue;
+        };
+
+        insertions.push((
+            with_index,
+            InsertKind::OpenParen,
+            TokenWithSpan::new(Token::LParen, open_span),
+        ));
+        insertions.push((
+            statement_end,
+            InsertKind::CloseParen,
+            TokenWithSpan::new(Token::RParen, close_span),
+        ));
+    }
+
+    if insertions.is_empty() {
+        return false;
+    }
+
+    insertions.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut adapted = Vec::with_capacity(tokens.len() + insertions.len());
+    let mut insertion_index = 0;
+    for index in 0..=tokens.len() {
+        while insertions
+            .get(insertion_index)
+            .is_some_and(|(at, _, _)| *at == index)
+        {
+            adapted.push(insertions[insertion_index].2.clone());
+            insertion_index += 1;
+        }
+        if index < tokens.len() {
+            adapted.push(tokens[index].clone());
+        }
+    }
+    *tokens = adapted;
+    true
+}
+
+fn find_inline_table_function_returns(
+    tokens: &[TokenWithSpan],
+    significant: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut functions = Vec::new();
+
+    for position in 0..significant.len() {
+        if position > 0 && !matches!(tokens[significant[position - 1]].token, Token::SemiColon) {
+            continue;
+        }
+
+        let mut function_position = position;
+        if word_is_at(tokens, significant, function_position, "CREATE") {
+            function_position += 1;
+            if word_is_at(tokens, significant, function_position, "OR")
+                && word_is_at(tokens, significant, function_position + 1, "ALTER")
+            {
+                function_position += 2;
+            }
+        } else {
+            continue;
+        }
+
+        if !word_is_at(tokens, significant, function_position, "FUNCTION") {
+            continue;
+        }
+
+        let name_start = function_position + 1;
+        let Some(name_end) = parse_object_name_end(tokens, significant, name_start) else {
+            continue;
+        };
+        let Some(parameter_open) = next_significant_index(significant, name_end) else {
+            continue;
+        };
+        if !matches!(tokens[parameter_open].token, Token::LParen) {
+            continue;
+        }
+        let Some(parameter_close) = matching_paren(tokens, parameter_open) else {
+            continue;
+        };
+        let Some(returns_index) = next_significant_index(significant, parameter_close) else {
+            continue;
+        };
+        if !word_is(tokens, returns_index, "RETURNS") {
+            continue;
+        }
+        let Some(table_index) = next_significant_index(significant, returns_index) else {
+            continue;
+        };
+        if !word_is(tokens, table_index, "TABLE") {
+            continue;
+        }
+
+        let Some((_, with_index)) = find_cte_return_after_table(tokens, significant, table_index)
+        else {
+            continue;
+        };
+        let Some(statement_end) = function_return_statement_end(tokens, with_index) else {
+            continue;
+        };
+        functions.push((with_index, statement_end));
+    }
+
+    functions
+}
+
+fn find_cte_return_after_table(
+    tokens: &[TokenWithSpan],
+    significant: &[usize],
+    table_index: usize,
+) -> Option<(usize, usize)> {
+    for &index in significant.iter().filter(|&&index| index > table_index) {
+        if matches!(tokens[index].token, Token::SemiColon | Token::EOF) {
+            return None;
+        }
+        if word_is(tokens, index, "RETURN") {
+            let with_index = next_significant_index(significant, index)?;
+            return word_is(tokens, with_index, "WITH").then_some((index, with_index));
+        }
+    }
+    None
+}
+
+fn function_return_statement_end(tokens: &[TokenWithSpan], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match &token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.checked_sub(1)?,
+            Token::SemiColon if depth == 0 => return Some(index),
+            Token::EOF => return Some(index),
+            _ => {}
+        }
+    }
+    Some(tokens.len())
+}
+
+fn has_balanced_parentheses(tokens: &[TokenWithSpan], range: Range<usize>) -> bool {
+    let mut depth = 0usize;
+    for token in &tokens[range] {
+        match &token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 #[derive(Debug)]
@@ -759,6 +933,80 @@ mod tests {
             "SELECT @minimum AS value"
         );
         assert_eq!(output.statements[1].to_string(), "SELECT 2");
+    }
+
+    #[test]
+    fn parses_unparenthesized_cte_return_bodies_for_mssql_inline_functions() {
+        for modifier in ["CREATE", "CREATE OR ALTER"] {
+            let sql = format!(
+                "-- café\r\n{modifier} FUNCTION dbo.demo_fn() RETURNS TABLE AS RETURN \
+                 WITH demo_cte AS (SELECT 1 AS demo_value) \
+                 SELECT demo_value FROM demo_cte;\r\nSELECT 2;"
+            );
+            let output = parse_sql_with_dialect_output(&sql, FlowDialect::Mssql).expect("parse");
+
+            assert!(
+                output.parser_fallback_used,
+                "expected token adaptation for {modifier}"
+            );
+            assert_eq!(output.statements.len(), 2, "{modifier}");
+            let Statement::CreateFunction(function) = &output.statements[0] else {
+                panic!("expected CREATE FUNCTION for {modifier}");
+            };
+            let Some(CreateFunctionBody::AsReturnExpr(expression)) = &function.function_body else {
+                panic!("expected a RETURN expression body for {modifier}");
+            };
+            assert_eq!(
+                text_for_span(&sql, expression.span()),
+                "WITH demo_cte AS (SELECT 1 AS demo_value) SELECT demo_value FROM demo_cte",
+                "{modifier}"
+            );
+            assert_eq!(
+                text_for_span(&sql, output.statements[1].span()),
+                "SELECT 2",
+                "{modifier}"
+            );
+            assert_eq!(output.statements[1].to_string(), "SELECT 2", "{modifier}");
+        }
+    }
+
+    #[test]
+    fn parses_unparenthesized_cte_return_body_through_eof() {
+        let sql = "CREATE FUNCTION dbo.demo_rows() RETURNS TABLE AS RETURN WITH demo_cte AS (SELECT 1 AS demo_value) SELECT demo_value FROM demo_cte";
+        let output = parse_sql_with_dialect_output(sql, FlowDialect::Mssql).expect("parse");
+
+        assert!(output.parser_fallback_used);
+        assert_eq!(output.statements.len(), 1);
+        let Statement::CreateFunction(function) = &output.statements[0] else {
+            panic!("expected CREATE FUNCTION");
+        };
+        let Some(CreateFunctionBody::AsReturnExpr(expression)) = &function.function_body else {
+            panic!("expected a RETURN expression body");
+        };
+        assert_eq!(
+            text_for_span(sql, expression.span()),
+            "WITH demo_cte AS (SELECT 1 AS demo_value) SELECT demo_value FROM demo_cte"
+        );
+    }
+
+    #[test]
+    fn malformed_unparenthesized_cte_function_returns_remain_errors_at_source_positions() {
+        for sql in [
+            "-- café\r\nCREATE FUNCTION dbo.bad() RETURNS TABLE AS RETURN WITH demo_cte AS SELECT 1 SELECT 1;",
+            "-- café\r\nCREATE OR ALTER FUNCTION dbo.bad() RETURNS TABLE AS RETURN WITH demo_cte AS (SELECT 1);",
+            "-- café\r\nCREATE OR ALTER FUNCTION dbo.bad() RETURNS TABLE AS RETURN WITH demo_cte AS (SELECT 1) SELECT FROM demo_cte;",
+        ] {
+            let error = parse_mssql(sql);
+            assert_eq!(error.position.map(|position| position.line), Some(2));
+        }
+    }
+
+    #[test]
+    fn unparenthesized_cte_function_adapter_is_mssql_only() {
+        let sql = "CREATE FUNCTION dbo.demo_fn() RETURNS TABLE AS RETURN WITH demo_cte AS (SELECT 1 AS demo_value) SELECT demo_value FROM demo_cte;";
+
+        assert!(parse_sql_with_dialect_output(sql, FlowDialect::Mssql).is_ok());
+        assert!(parse_sql_with_dialect_output(sql, FlowDialect::Generic).is_err());
     }
 
     #[test]
