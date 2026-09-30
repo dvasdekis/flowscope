@@ -3,13 +3,18 @@
 //! This module handles the parsing and collection of SQL statements from analysis requests,
 //! supporting both file-based and inline SQL inputs.
 
+use super::external_metadata::{parse_external_metadata_statement, ExternalMetadataStatement};
+use crate::error::{ParseError, ParseErrorKind, Position};
 use crate::limits::{MAX_ANALYSIS_SOURCE_BYTES, MAX_ANALYSIS_TOTAL_BYTES};
-use crate::parser::{parse_sql_with_dialect, parse_sql_with_dialect_output};
+use crate::parser::{parse_sql_with_dialect_output, ParseSqlOutput};
 use crate::types::{issue_codes, AnalyzeRequest, Dialect, Issue, Span};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{
+    Ident, Query, SetExpr, Statement, TableAliasColumnDef, TableFactor, TableWithJoins,
+};
 use sqlparser::dialect::MsSqlDialect;
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use thiserror::Error;
@@ -20,6 +25,11 @@ use crate::templater::{template_sql, TemplateMode};
 /// Maximum iterations allowed when merging statement ranges to prevent infinite loops
 /// on malformed SQL input.
 const MAX_MERGE_ITERATIONS: usize = 10_000;
+pub(super) const MAX_MSSQL_EXPANDED_STATEMENT_RANGES: usize = 100_000;
+const MAX_MSSQL_GO_SEPARATORS: usize = 100_000;
+/// Repeated MSSQL batches are expanded for analysis, but the count is bounded to avoid
+/// untrusted `GO n` lines multiplying work without limit.
+pub(super) const MAX_MSSQL_GO_REPEAT: usize = 1_000;
 
 #[derive(Clone, Copy)]
 enum AnalysisSource<'a> {
@@ -210,10 +220,849 @@ struct ParseContext<'a> {
     templating_applied: bool,
 }
 
-/// A parsed statement alongside optional source metadata.
+struct MssqlOpenRowsetSchema {
+    openrowset_offset: usize,
+    replacement_range: Range<usize>,
+    columns: Vec<TableAliasColumnDef>,
+}
+
+struct MssqlOpenRowsetCompatibility {
+    sql: String,
+    schemas: Vec<MssqlOpenRowsetSchema>,
+}
+
+fn parse_input_sql_with_dialect_output(
+    sql: &str,
+    dialect: Dialect,
+) -> Result<ParseSqlOutput, ParseError> {
+    let original = parse_sql_with_dialect_output(sql, dialect);
+    if original.is_ok() || !matches!(dialect, Dialect::Mssql) {
+        return original;
+    }
+
+    let Some(compatibility) = mssql_openrowset_compatibility(sql) else {
+        return original;
+    };
+
+    let mut output = parse_sql_with_dialect_output(&compatibility.sql, dialect)?;
+    if !compatibility.schemas.is_empty()
+        && !mssql_apply_openrowset_schema_columns(
+            sql,
+            &mut output.statements,
+            compatibility.schemas,
+        )
+    {
+        return original;
+    }
+    output.parser_fallback_used = true;
+    Ok(output)
+}
+
+pub(crate) enum InputParseOutput {
+    ParsedSql(ParseSqlOutput),
+    ExternalMetadata(ExternalMetadataStatement, bool),
+}
+
+#[derive(Debug)]
+pub(crate) enum InputParseError {
+    ExternalMetadata(ParseError),
+    Parser(ParseError),
+}
+
+impl InputParseError {
+    pub(crate) fn into_parse_error(self) -> ParseError {
+        match self {
+            Self::ExternalMetadata(error) | Self::Parser(error) => error,
+        }
+    }
+}
+
+pub(crate) fn parse_input_statement_with_dialect_output(
+    sql: &str,
+    dialect: Dialect,
+) -> Result<InputParseOutput, InputParseError> {
+    if matches!(dialect, Dialect::Mssql) {
+        match parse_external_metadata_statement(sql) {
+            Ok(Some(metadata)) => {
+                let parser_fallback_used = match &metadata {
+                    ExternalMetadataStatement::Cetas(cetas) => {
+                        validate_cetas_query(sql, cetas, dialect)
+                            .map_err(InputParseError::ExternalMetadata)?
+                    }
+                    ExternalMetadataStatement::FileFormat(_) => false,
+                };
+                return Ok(InputParseOutput::ExternalMetadata(
+                    metadata,
+                    parser_fallback_used,
+                ));
+            }
+            Err(error) => return Err(InputParseError::ExternalMetadata(error)),
+            Ok(None) => {}
+        }
+    }
+
+    parse_input_sql_with_dialect_output(sql, dialect)
+        .map(InputParseOutput::ParsedSql)
+        .map_err(InputParseError::Parser)
+}
+
+fn validate_cetas_query(
+    sql: &str,
+    cetas: &super::external_metadata::CetasDefinition,
+    dialect: Dialect,
+) -> Result<bool, ParseError> {
+    let query_sql = sql.get(cetas.query_range.clone()).ok_or_else(|| {
+        ParseError::new("Could not read the CETAS SELECT query source range")
+            .with_dialect(dialect)
+            .with_kind(ParseErrorKind::SyntaxError)
+    })?;
+    let output = parse_input_sql_with_dialect_output(query_sql, dialect).map_err(|mut error| {
+        if let Some(position) = error.position {
+            if let Some(relative_offset) = crate::analyzer::helpers::line_col_to_offset(
+                query_sql,
+                position.line,
+                position.column,
+            ) {
+                if let Some(source_offset) = cetas.query_range.start.checked_add(relative_offset) {
+                    if let Some(source_position) = offset_to_position(sql, source_offset) {
+                        if let Some(message_position) = error.message.rfind(" at Line:") {
+                            error.message.truncate(message_position);
+                        }
+                        error.position = Some(source_position);
+                    }
+                }
+            }
+        }
+        error.dialect = Some(dialect);
+        error
+    })?;
+
+    if matches!(
+        output.statements.as_slice(),
+        [Statement::Query(query)] if is_select_query_body(query.body.as_ref())
+    ) {
+        return Ok(output.parser_fallback_used);
+    }
+
+    let position =
+        offset_to_position(sql, cetas.query_range.start).unwrap_or(Position { line: 1, column: 1 });
+    Err(ParseError::with_position(
+        "CREATE EXTERNAL TABLE AS SELECT requires exactly one SELECT query",
+        position.line,
+        position.column,
+    )
+    .with_dialect(dialect)
+    .with_kind(ParseErrorKind::SyntaxError))
+}
+
+fn is_select_query_body(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(_) => true,
+        SetExpr::SetOperation { left, right, .. } => {
+            is_select_query_body(left) && is_select_query_body(right)
+        }
+        _ => false,
+    }
+}
+
+fn offset_to_position(sql: &str, offset: usize) -> Option<Position> {
+    let prefix = sql.get(..offset)?;
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let current_line = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
+    Some(Position {
+        line,
+        column: current_line.chars().count() + 1,
+    })
+}
+
+/// Rewrites only documented Synapse `OPENROWSET(BULK ..., OPTION = value, ...)`
+/// arguments to sqlparser's equivalent named-argument syntax. Each replacement
+/// preserves its byte length and line breaks so source offsets stay aligned.
+#[cfg(test)]
+fn mssql_openrowset_compatible_sql(sql: &str) -> Option<String> {
+    mssql_openrowset_compatibility(sql).map(|compatibility| compatibility.sql)
+}
+
+fn mssql_openrowset_compatibility(sql: &str) -> Option<MssqlOpenRowsetCompatibility> {
+    const OPTIONS: &[&str] = &[
+        "CODEPAGE",
+        "DATA_COMPRESSION",
+        "DATA_SOURCE",
+        "DATAFILETYPE",
+        "ERRORFILE_DATA_SOURCE",
+        "ERRORFILE_LOCATION",
+        "ESCAPECHAR",
+        "FIELDQUOTE",
+        "FIELDTERMINATOR",
+        "FIRSTROW",
+        "FORMAT",
+        "HEADER_ROW",
+        "MAXERRORS",
+        "PARSER_VERSION",
+        "ROWSET_OPTIONS",
+        "ROWTERMINATOR",
+    ];
+
+    let tokens = Tokenizer::new(&MsSqlDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    let mut replacements = Vec::new();
+    let mut schema_replacements = Vec::new();
+    let mut schemas = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if word.quote_style.is_some() || !word.value.eq_ignore_ascii_case("OPENROWSET") {
+            continue;
+        }
+        if !mssql_openrowset_is_table_factor(&tokens, index) {
+            continue;
+        }
+
+        let Some(open_paren) = mssql_next_significant_token(&tokens, index + 1) else {
+            continue;
+        };
+        if !matches!(tokens[open_paren].token, Token::LParen) {
+            continue;
+        }
+        let Some(close_paren) = mssql_matching_paren(&tokens, open_paren) else {
+            continue;
+        };
+        let Some(argument_ranges) = mssql_openrowset_arguments(&tokens, open_paren, close_paren)
+        else {
+            continue;
+        };
+        let Some(argument_replacements) =
+            mssql_synapse_openrowset_argument_replacements(sql, &tokens, &argument_ranges, OPTIONS)
+        else {
+            continue;
+        };
+
+        let openrowset_offset = mssql_token_byte_range(sql, token)?.start;
+        let schema = match mssql_openrowset_schema_after_call(
+            sql,
+            &tokens,
+            close_paren,
+            openrowset_offset,
+        ) {
+            Ok(schema) => schema,
+            Err(()) => continue,
+        };
+        replacements.extend(argument_replacements);
+        if let Some(schema) = schema {
+            schema_replacements.push(schema.replacement_range.clone());
+            schemas.push(schema);
+        }
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+
+    replacements.sort_unstable();
+    replacements.dedup();
+    let mut compatible_bytes = sql.as_bytes().to_vec();
+    for range in schema_replacements {
+        if range.start > range.end
+            || range.end > compatible_bytes.len()
+            || !sql.is_char_boundary(range.start)
+            || !sql.is_char_boundary(range.end)
+        {
+            return None;
+        }
+        for byte in &mut compatible_bytes[range] {
+            if !matches!(*byte, b'\r' | b'\n') {
+                *byte = b' ';
+            }
+        }
+    }
+    let mut compatible_sql = String::from_utf8(compatible_bytes).ok()?;
+    for offset in replacements {
+        let byte = *compatible_sql.as_bytes().get(offset)?;
+        if byte != b'=' && !matches!(byte, b' ' | b'\t') {
+            return None;
+        }
+        compatible_sql.replace_range(offset..offset + 1, ":");
+    }
+    (compatible_sql != sql).then_some(MssqlOpenRowsetCompatibility {
+        sql: compatible_sql,
+        schemas,
+    })
+}
+
+fn mssql_openrowset_schema_after_call(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    call_close_paren: usize,
+    openrowset_offset: usize,
+) -> Result<Option<MssqlOpenRowsetSchema>, ()> {
+    let Some(with_index) = mssql_next_significant_token(tokens, call_close_paren + 1) else {
+        return Ok(None);
+    };
+    let Token::Word(with_keyword) = &tokens[with_index].token else {
+        return Ok(None);
+    };
+    if with_keyword.quote_style.is_some() || !with_keyword.value.eq_ignore_ascii_case("WITH") {
+        return Ok(None);
+    }
+
+    let open_paren = mssql_next_significant_token(tokens, with_index + 1).ok_or(())?;
+    if !matches!(tokens[open_paren].token, Token::LParen) {
+        return Err(());
+    }
+    let close_paren = mssql_matching_paren(tokens, open_paren).ok_or(())?;
+    let column_ranges = mssql_openrowset_arguments(tokens, open_paren, close_paren).ok_or(())?;
+    let columns = mssql_synapse_openrowset_schema_columns(sql, tokens, &column_ranges).ok_or(())?;
+    let with_range = mssql_token_byte_range(sql, &tokens[with_index]).ok_or(())?;
+    let close_range = mssql_token_byte_range(sql, &tokens[close_paren]).ok_or(())?;
+
+    Ok(Some(MssqlOpenRowsetSchema {
+        openrowset_offset,
+        replacement_range: with_range.start..close_range.end,
+        columns,
+    }))
+}
+
+fn mssql_synapse_openrowset_schema_columns(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    column_ranges: &[Range<usize>],
+) -> Option<Vec<TableAliasColumnDef>> {
+    let mut definitions = Vec::with_capacity(column_ranges.len());
+    for range in column_ranges {
+        let significant = mssql_significant_token_indices(tokens, range);
+        if significant.len() < 2 {
+            return None;
+        }
+
+        if !matches!(tokens[*significant.first()?].token, Token::Word(_)) {
+            return None;
+        }
+
+        let mut definition_tokens = significant;
+        let last_index = *definition_tokens.last()?;
+        if mssql_token_is_at_top_level(tokens, range, last_index) {
+            match &tokens[last_index].token {
+                Token::Number(ordinal, _) => {
+                    ordinal.parse::<usize>().ok().filter(|value| *value > 0)?;
+                    definition_tokens.pop();
+                }
+                Token::SingleQuotedString(_) | Token::NationalStringLiteral(_) => {
+                    definition_tokens.pop();
+                }
+                _ => {}
+            }
+        }
+        if definition_tokens.len() < 2 {
+            return None;
+        }
+
+        let start = mssql_token_byte_range(sql, &tokens[*definition_tokens.first()?])?.start;
+        let end = mssql_token_byte_range(sql, &tokens[*definition_tokens.last()?])?.end;
+        definitions.push(sql.get(start..end)?.to_string());
+    }
+
+    let create_sql = format!(
+        "CREATE TABLE [__flowscope_openrowset_schema] ({})",
+        definitions.join(", ")
+    );
+    let output = parse_sql_with_dialect_output(&create_sql, Dialect::Mssql).ok()?;
+    let mut statements = output.statements.into_iter();
+    let Statement::CreateTable(create) = statements.next()? else {
+        return None;
+    };
+    if statements.next().is_some()
+        || create.columns.len() != definitions.len()
+        || create
+            .columns
+            .iter()
+            .any(|column| !column.options.is_empty())
+    {
+        return None;
+    }
+
+    Some(
+        create
+            .columns
+            .into_iter()
+            .map(|column| TableAliasColumnDef {
+                name: column.name,
+                data_type: Some(column.data_type),
+            })
+            .collect(),
+    )
+}
+
+fn mssql_token_is_at_top_level(
+    tokens: &[TokenWithSpan],
+    range: &Range<usize>,
+    target_index: usize,
+) -> bool {
+    let mut depth = 0usize;
+    for token in &tokens[range.start..target_index] {
+        match token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn mssql_apply_openrowset_schema_columns(
+    sql: &str,
+    statements: &mut [Statement],
+    schemas: Vec<MssqlOpenRowsetSchema>,
+) -> bool {
+    let mut schemas: HashMap<_, _> = schemas
+        .into_iter()
+        .map(|schema| (schema.openrowset_offset, schema.columns))
+        .collect();
+    for statement in statements {
+        if !mssql_apply_openrowset_schema_columns_to_statement(statement, sql, &mut schemas) {
+            return false;
+        }
+    }
+    schemas.is_empty()
+}
+
+fn mssql_apply_openrowset_schema_columns_to_statement(
+    statement: &mut Statement,
+    sql: &str,
+    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
+) -> bool {
+    match statement {
+        Statement::Query(query) => {
+            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
+        }
+        Statement::Insert(insert) => insert.source.as_mut().is_none_or(|query| {
+            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
+        }),
+        Statement::CreateTable(create) => create.query.as_mut().is_none_or(|query| {
+            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
+        }),
+        Statement::CreateView(create) => {
+            mssql_apply_openrowset_schema_columns_to_query(&mut create.query, sql, schemas)
+        }
+        Statement::Update(update) => {
+            mssql_apply_openrowset_schema_columns_to_table_with_joins(
+                &mut update.table,
+                sql,
+                schemas,
+            ) && update.from.as_mut().is_none_or(|from| {
+                let tables = match from {
+                    sqlparser::ast::UpdateTableFromKind::BeforeSet(tables)
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(tables) => tables,
+                };
+                tables.iter_mut().all(|table| {
+                    mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
+                })
+            })
+        }
+        Statement::Delete(delete) => {
+            let from_tables = match &mut delete.from {
+                sqlparser::ast::FromTable::WithFromKeyword(tables)
+                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+            };
+            from_tables.iter_mut().all(|table| {
+                mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
+            }) && delete.using.as_mut().is_none_or(|tables| {
+                tables.iter_mut().all(|table| {
+                    mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
+                })
+            })
+        }
+        Statement::Merge(merge) => {
+            mssql_apply_openrowset_schema_columns_to_table_factor(&mut merge.table, sql, schemas)
+                && mssql_apply_openrowset_schema_columns_to_table_factor(
+                    &mut merge.source,
+                    sql,
+                    schemas,
+                )
+        }
+        _ => true,
+    }
+}
+
+fn mssql_apply_openrowset_schema_columns_to_query(
+    query: &mut Query,
+    sql: &str,
+    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
+) -> bool {
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            if !mssql_apply_openrowset_schema_columns_to_query(&mut cte.query, sql, schemas) {
+                return false;
+            }
+        }
+    }
+    mssql_apply_openrowset_schema_columns_to_set_expr(&mut query.body, sql, schemas)
+}
+
+fn mssql_apply_openrowset_schema_columns_to_set_expr(
+    set_expr: &mut SetExpr,
+    sql: &str,
+    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
+) -> bool {
+    match set_expr {
+        SetExpr::Select(select) => select.from.iter_mut().all(|table| {
+            mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
+        }),
+        SetExpr::Query(query) => {
+            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            mssql_apply_openrowset_schema_columns_to_set_expr(left, sql, schemas)
+                && mssql_apply_openrowset_schema_columns_to_set_expr(right, sql, schemas)
+        }
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => {
+            mssql_apply_openrowset_schema_columns_to_statement(statement, sql, schemas)
+        }
+        _ => true,
+    }
+}
+
+fn mssql_apply_openrowset_schema_columns_to_table_with_joins(
+    table: &mut TableWithJoins,
+    sql: &str,
+    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
+) -> bool {
+    mssql_apply_openrowset_schema_columns_to_table_factor(&mut table.relation, sql, schemas)
+        && table.joins.iter_mut().all(|join| {
+            mssql_apply_openrowset_schema_columns_to_table_factor(&mut join.relation, sql, schemas)
+        })
+}
+
+fn mssql_apply_openrowset_schema_columns_to_table_factor(
+    table_factor: &mut TableFactor,
+    sql: &str,
+    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
+) -> bool {
+    match table_factor {
+        TableFactor::Table { name, alias, .. } => {
+            let Some(first_name) = name.0.first().and_then(|part| part.as_ident()) else {
+                return true;
+            };
+            if !first_name.value.eq_ignore_ascii_case("OPENROWSET") {
+                return true;
+            }
+            let Some(offset) = mssql_ident_byte_offset(sql, first_name) else {
+                return false;
+            };
+            let Some(columns) = schemas.remove(&offset) else {
+                return true;
+            };
+            let Some(alias) = alias else {
+                return false;
+            };
+            if alias.columns.is_empty() {
+                alias.columns = columns;
+                return true;
+            }
+            if alias.columns.len() != columns.len()
+                || alias
+                    .columns
+                    .iter()
+                    .any(|column| column.data_type.is_some())
+            {
+                return false;
+            }
+            for (alias_column, schema_column) in alias.columns.iter_mut().zip(columns) {
+                alias_column.data_type = schema_column.data_type;
+            }
+            true
+        }
+        TableFactor::Derived { subquery, .. } => {
+            mssql_apply_openrowset_schema_columns_to_query(subquery, sql, schemas)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => mssql_apply_openrowset_schema_columns_to_table_with_joins(
+            table_with_joins,
+            sql,
+            schemas,
+        ),
+        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
+            mssql_apply_openrowset_schema_columns_to_table_factor(table, sql, schemas)
+        }
+        _ => true,
+    }
+}
+
+fn mssql_ident_byte_offset(sql: &str, ident: &Ident) -> Option<usize> {
+    let span = ident.span;
+    let offset = crate::analyzer::helpers::line_col_to_offset(
+        sql,
+        span.start.line.try_into().ok()?,
+        span.start.column.try_into().ok()?,
+    )?;
+    (offset <= sql.len() && sql.is_char_boundary(offset)).then_some(offset)
+}
+
+fn mssql_openrowset_is_table_factor(tokens: &[TokenWithSpan], index: usize) -> bool {
+    let mut previous = index;
+    while previous > 0 {
+        previous -= 1;
+        if matches!(tokens[previous].token, Token::Whitespace(_)) {
+            continue;
+        }
+
+        if matches!(tokens[previous].token, Token::Period) {
+            return false;
+        }
+        return match &tokens[previous].token {
+            Token::Word(word) => ["APPLY", "FROM", "JOIN"]
+                .iter()
+                .any(|keyword| word.value.eq_ignore_ascii_case(keyword)),
+            Token::Comma => mssql_comma_is_in_from_clause(tokens, previous),
+            _ => false,
+        };
+    }
+    false
+}
+
+fn mssql_comma_is_in_from_clause(tokens: &[TokenWithSpan], comma_index: usize) -> bool {
+    let mut nested_depth = 0usize;
+    for token in tokens[..comma_index].iter().rev() {
+        match &token.token {
+            Token::RParen => nested_depth += 1,
+            Token::LParen if nested_depth > 0 => nested_depth -= 1,
+            Token::LParen => return false,
+            Token::Word(word) if nested_depth == 0 => {
+                if word.value.eq_ignore_ascii_case("FROM") {
+                    return true;
+                }
+                if [
+                    "WHERE",
+                    "GROUP",
+                    "HAVING",
+                    "ORDER",
+                    "QUALIFY",
+                    "UNION",
+                    "EXCEPT",
+                    "INTERSECT",
+                    "ON",
+                    "SET",
+                    "VALUES",
+                    "RETURNING",
+                ]
+                .iter()
+                .any(|keyword| word.value.eq_ignore_ascii_case(keyword))
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn mssql_next_significant_token(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
+    while index < tokens.len() {
+        if !matches!(tokens[index].token, Token::Whitespace(_)) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn mssql_matching_paren(tokens: &[TokenWithSpan], open_paren: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open_paren) {
+        match token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn mssql_openrowset_arguments(
+    tokens: &[TokenWithSpan],
+    open_paren: usize,
+    close_paren: usize,
+) -> Option<Vec<Range<usize>>> {
+    let mut arguments = Vec::new();
+    let mut argument_start = open_paren + 1;
+    let mut depth = 0usize;
+    for (index, token) in tokens
+        .iter()
+        .enumerate()
+        .take(close_paren)
+        .skip(open_paren + 1)
+    {
+        match token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.checked_sub(1)?,
+            Token::Comma if depth == 0 => {
+                arguments.push(argument_start..index);
+                argument_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    arguments.push(argument_start..close_paren);
+    (!arguments.iter().any(Range::is_empty)).then_some(arguments)
+}
+
+fn mssql_synapse_openrowset_argument_replacements(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    argument_ranges: &[Range<usize>],
+    options: &[&str],
+) -> Option<Vec<usize>> {
+    let mut significant = mssql_significant_token_indices(tokens, argument_ranges.first()?);
+    let bulk_index = *significant.first()?;
+    let Token::Word(bulk) = &tokens[bulk_index].token else {
+        return None;
+    };
+    if bulk.quote_style.is_some() || !bulk.value.eq_ignore_ascii_case("BULK") {
+        return None;
+    }
+    let path_index = *significant.get(1)?;
+    if significant.len() != 2 {
+        return None;
+    }
+    if !matches!(
+        tokens[path_index].token,
+        Token::SingleQuotedString(_) | Token::NationalStringLiteral(_)
+    ) {
+        return None;
+    }
+
+    let bulk_range = mssql_token_byte_range(sql, &tokens[bulk_index])?;
+    let path_range = mssql_token_byte_range(sql, &tokens[path_index])?;
+    let separator = sql.get(bulk_range.end..path_range.start)?;
+    let bulk_separator = separator
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, ' ' | '\t').then_some(bulk_range.end + index))?;
+    let mut replacements = vec![bulk_separator];
+    let mut seen_options = std::collections::HashSet::new();
+    let mut seen_data_source = false;
+    let mut seen_format = false;
+
+    for range in argument_ranges.iter().skip(1) {
+        significant = mssql_significant_token_indices(tokens, range);
+        if significant.len() != 3 {
+            return None;
+        }
+        let key_index = *significant.first()?;
+        let equals_index = *significant.get(1)?;
+        let value_index = *significant.get(2)?;
+        let Token::Word(key) = &tokens[key_index].token else {
+            return None;
+        };
+        let option = key.value.to_ascii_uppercase();
+        if key.quote_style.is_some()
+            || !options.iter().any(|allowed| *allowed == option)
+            || !seen_options.insert(option.clone())
+            || !matches!(tokens[equals_index].token, Token::Eq)
+            || !mssql_synapse_openrowset_option_value_is_valid(&option, &tokens[value_index].token)
+        {
+            return None;
+        }
+        if option == "FORMAT" {
+            seen_format = true;
+        } else if option == "DATA_SOURCE" {
+            if seen_format || seen_data_source {
+                return None;
+            }
+            seen_data_source = true;
+        } else if !seen_format {
+            return None;
+        }
+        let equals_range = mssql_token_byte_range(sql, &tokens[equals_index])?;
+        if sql.get(equals_range.clone())? != "=" {
+            return None;
+        }
+        replacements.push(equals_range.start);
+    }
+
+    seen_format.then_some(replacements)
+}
+
+fn mssql_significant_token_indices(tokens: &[TokenWithSpan], range: &Range<usize>) -> Vec<usize> {
+    range
+        .clone()
+        .filter(|index| !matches!(tokens[*index].token, Token::Whitespace(_)))
+        .collect()
+}
+
+fn mssql_synapse_openrowset_option_value_is_valid(option: &str, value: &Token) -> bool {
+    match option {
+        "FORMAT" => match value {
+            Token::SingleQuotedString(format) | Token::NationalStringLiteral(format) => {
+                ["CSV", "DELTA", "PARQUET"]
+                    .iter()
+                    .any(|supported| format.eq_ignore_ascii_case(supported))
+            }
+            _ => false,
+        },
+        "HEADER_ROW" => {
+            matches!(value, Token::Word(word) if word.quote_style.is_none() && (word.value.eq_ignore_ascii_case("TRUE") || word.value.eq_ignore_ascii_case("FALSE")))
+        }
+        "FIRSTROW" | "MAXERRORS" => {
+            matches!(
+                value,
+                Token::Number(_, _)
+                    | Token::SingleQuotedString(_)
+                    | Token::NationalStringLiteral(_)
+            )
+        }
+        "CODEPAGE" => {
+            matches!(
+                value,
+                Token::Number(_, _)
+                    | Token::SingleQuotedString(_)
+                    | Token::NationalStringLiteral(_)
+            )
+        }
+        _ => matches!(
+            value,
+            Token::SingleQuotedString(_) | Token::NationalStringLiteral(_)
+        ),
+    }
+}
+
+fn mssql_token_byte_range(sql: &str, token: &TokenWithSpan) -> Option<Range<usize>> {
+    let start = crate::analyzer::helpers::line_col_to_offset(
+        sql,
+        token.span.start.line.try_into().ok()?,
+        token.span.start.column.try_into().ok()?,
+    )?;
+    let end = crate::analyzer::helpers::line_col_to_offset(
+        sql,
+        token.span.end.line.try_into().ok()?,
+        token.span.end.column.try_into().ok()?,
+    )?;
+    (start <= end && end <= sql.len() && sql.is_char_boundary(start) && sql.is_char_boundary(end))
+        .then_some(start..end)
+}
+
+/// A parsed SQL statement or explicitly classified metadata-only statement.
+#[derive(Debug)]
+pub(crate) enum StatementInputKind {
+    Parsed(Box<Statement>),
+    ExternalMetadata(ExternalMetadataStatement),
+}
+
+/// A statement alongside its source metadata.
 pub(crate) struct StatementInput<'a> {
-    /// The parsed SQL statement.
-    pub(crate) statement: Statement,
+    /// The parsed SQL statement or metadata-only classification.
+    pub(crate) statement: StatementInputKind,
     /// Optional source file name for error reporting and tracing.
     ///
     /// Uses `Rc<String>` to avoid repeated heap allocations when the same file
@@ -280,6 +1129,9 @@ pub(crate) fn collect_statements<'a>(
 ) -> (Vec<StatementInput<'a>>, Vec<Issue>) {
     let mut issues = Vec::new();
     let mut statements = Vec::new();
+    // Share the repeat budget across every source in the request so separate files
+    // cannot each consume the full expansion allowance.
+    let mut remaining_mssql_ranges = MAX_MSSQL_GO_REPEAT;
 
     let has_sql = !request.sql.trim().is_empty();
     let has_files = request
@@ -321,7 +1173,8 @@ pub(crate) fn collect_statements<'a>(
                 untemplated_sql: templating_applied.then_some(Cow::Borrowed(file.content.as_str())),
                 templating_applied,
             };
-            let (file_stmts, file_issues) = parse_statements_individually(&ctx);
+            let (file_stmts, file_issues) =
+                parse_statements_individually(&ctx, &mut remaining_mssql_ranges);
             statements.extend(file_stmts);
             issues.extend(file_issues);
         }
@@ -353,7 +1206,8 @@ pub(crate) fn collect_statements<'a>(
             untemplated_sql: templating_applied.then_some(Cow::Borrowed(request.sql.as_str())),
             templating_applied,
         };
-        let (inline_stmts, inline_issues) = parse_statements_individually(&ctx);
+        let (inline_stmts, inline_issues) =
+            parse_statements_individually(&ctx, &mut remaining_mssql_ranges);
         statements.extend(inline_stmts);
         issues.extend(inline_issues);
     }
@@ -369,14 +1223,37 @@ pub(crate) fn collect_statements<'a>(
 /// statements can still be analyzed.
 fn parse_statements_individually<'a>(
     ctx: &ParseContext<'a>,
+    remaining_mssql_ranges: &mut usize,
 ) -> (Vec<StatementInput<'a>>, Vec<Issue>) {
-    let statement_ranges = compute_statement_ranges_for_dialect(&ctx.source_sql, ctx.dialect);
+    let statement_ranges = match compute_statement_ranges_for_dialect_with_limit(
+        &ctx.source_sql,
+        ctx.dialect,
+        *remaining_mssql_ranges,
+    ) {
+        Ok(ranges) => ranges,
+        Err(()) => {
+            let mut issue = Issue::error(
+                issue_codes::INVALID_REQUEST,
+                "SQL input exceeds the supported MSSQL batch expansion limit",
+            );
+            if let Some(source_name) = ctx.source_name.as_deref() {
+                issue = issue.with_source_name(source_name);
+            }
+            return (Vec::new(), vec![issue]);
+        }
+    };
+    if matches!(ctx.dialect, Dialect::Mssql) {
+        *remaining_mssql_ranges = remaining_mssql_ranges.saturating_sub(statement_ranges.len());
+    }
 
     match parse_full_sql_buffer(ctx, &statement_ranges) {
         Ok(statements) => (statements, Vec::new()),
         Err(fallback_error) => {
-            let (statements, mut issues) =
-                parse_statement_ranges_best_effort(ctx, statement_ranges);
+            let (statements, mut issues) = if matches!(ctx.dialect, Dialect::Mssql) {
+                parse_mssql_ranges_best_effort(ctx, statement_ranges)
+            } else {
+                parse_statement_ranges_best_effort(ctx, statement_ranges)
+            };
 
             // Surface the fallback reason to users so they understand why
             // best-effort parsing was used
@@ -411,8 +1288,14 @@ fn parse_full_sql_buffer<'a>(
     ctx: &ParseContext<'a>,
     statement_ranges: &[Range<usize>],
 ) -> Result<Vec<StatementInput<'a>>, Option<RangeAlignmentError>> {
+    if matches!(ctx.dialect, Dialect::Mssql)
+        && statement_ranges_contain_external_metadata(&ctx.source_sql, statement_ranges)
+    {
+        return Err(None);
+    }
+
     let parsed_output =
-        parse_sql_with_dialect_output(&ctx.source_sql, ctx.dialect).map_err(|_| None)?;
+        parse_input_sql_with_dialect_output(&ctx.source_sql, ctx.dialect).map_err(|_| None)?;
     let parser_fallback_used = parsed_output.parser_fallback_used;
     let parsed = parsed_output.statements;
 
@@ -439,14 +1322,14 @@ fn parse_full_sql_buffer<'a>(
     };
 
     let aligned_untemplated_ranges = ctx.untemplated_sql.as_deref().and_then(|sql| {
-        let ranges = compute_statement_ranges_for_dialect(sql, ctx.dialect);
+        let ranges = compute_statement_ranges_for_dialect(sql, ctx.dialect).ok()?;
         align_statement_ranges(sql, &ranges, ctx.dialect, parsed.len()).ok()
     });
 
     let mut statements = Vec::with_capacity(parsed.len());
     for (index, (stmt, range)) in parsed.into_iter().zip(aligned_ranges).enumerate() {
         statements.push(StatementInput {
-            statement: stmt,
+            statement: StatementInputKind::Parsed(Box::new(stmt)),
             source_name: ctx.source_name.clone(),
             source_sql: ctx.source_sql.clone(),
             source_range: range,
@@ -544,7 +1427,9 @@ fn merge_statement_ranges(
             }
 
             let snippet = &source_sql[current_range.clone()];
-            match parse_sql_with_dialect(snippet, dialect) {
+            match parse_input_sql_with_dialect_output(snippet, dialect)
+                .map(|output| output.statements)
+            {
                 // Found exactly one statement - this range is complete
                 Ok(parsed) if parsed.len() == 1 => {
                     merged.push(current_range);
@@ -581,23 +1466,42 @@ fn parse_statement_ranges_best_effort<'a>(
     let mut issues = Vec::new();
 
     let source_sql_ref: &str = &ctx.source_sql;
+    let aligned_untemplated_ranges = ctx.untemplated_sql.as_deref().and_then(|sql| {
+        let ranges = compute_statement_ranges_for_dialect(sql, ctx.dialect).ok()?;
+        align_statement_ranges(sql, &ranges, ctx.dialect, statement_ranges.len()).ok()
+    });
 
-    for range in statement_ranges {
+    for (range_index, range) in statement_ranges.into_iter().enumerate() {
         // Skip invalid ranges
         if range.start > range.end || range.end > source_sql_ref.len() {
             continue;
         }
 
         let statement_sql = &source_sql_ref[range.clone()];
+        let original_range = aligned_untemplated_ranges
+            .as_ref()
+            .and_then(|ranges| ranges.get(range_index).cloned());
 
-        match parse_sql_with_dialect_output(statement_sql, ctx.dialect) {
-            Ok(parsed_output) => {
+        match parse_input_statement_with_dialect_output(statement_sql, ctx.dialect) {
+            Ok(InputParseOutput::ExternalMetadata(metadata, parser_fallback_used)) => {
+                statements.push(StatementInput {
+                    statement: StatementInputKind::ExternalMetadata(metadata),
+                    source_name: ctx.source_name.clone(),
+                    source_sql: ctx.source_sql.clone(),
+                    source_range: range.clone(),
+                    source_sql_untemplated: ctx.untemplated_sql.clone(),
+                    source_range_untemplated: original_range.clone(),
+                    templating_applied: ctx.templating_applied,
+                    parser_fallback_used,
+                });
+            }
+            Ok(InputParseOutput::ParsedSql(parsed_output)) => {
                 let parser_fallback_used = parsed_output.parser_fallback_used;
 
                 // Typically one statement per range, but handle multiple if present
                 for stmt in parsed_output.statements {
                     statements.push(StatementInput {
-                        statement: stmt,
+                        statement: StatementInputKind::Parsed(Box::new(stmt)),
                         source_name: ctx.source_name.clone(),
                         source_sql: ctx.source_sql.clone(),
                         source_range: range.clone(),
@@ -608,11 +1512,24 @@ fn parse_statement_ranges_best_effort<'a>(
                     });
                 }
             }
-            Err(e) => {
+            Err(InputParseError::ExternalMetadata(error)) => {
+                let message = match ctx.source_name.as_deref() {
+                    Some(name) => format!("Parse error in {name}: {error}"),
+                    None => format!("Parse error: {error}"),
+                };
+                let issue_range = original_range.as_ref().unwrap_or(&range);
+                let mut issue = Issue::error(issue_codes::PARSE_ERROR, message)
+                    .with_span(Span::new(issue_range.start, issue_range.end));
+                if let Some(name) = ctx.source_name.as_deref() {
+                    issue = issue.with_source_name(name);
+                }
+                issues.push(issue);
+            }
+            Err(InputParseError::Parser(error)) => {
                 // Record the parse error but continue with remaining statements
                 let message = match ctx.source_name.as_deref() {
-                    Some(name) => format!("Parse error in {name}: {e}"),
-                    None => format!("Parse error: {e}"),
+                    Some(name) => format!("Parse error in {name}: {error}"),
+                    None => format!("Parse error: {error}"),
                 };
 
                 let mut issue = Issue::error(issue_codes::PARSE_ERROR, message)
@@ -628,108 +1545,505 @@ fn parse_statement_ranges_best_effort<'a>(
     (statements, issues)
 }
 
-pub(crate) fn split_statement_spans_with_dialect(sql: &str, dialect: Dialect) -> Vec<Span> {
-    compute_statement_ranges_for_dialect(sql, dialect)
-        .into_iter()
-        .map(|range| Span::new(range.start, range.end))
-        .collect()
+/// Parse MSSQL input by preserving complete `BEGIN`/`END` blocks during recovery.
+///
+/// The general statement splitter is intentionally dialect-neutral and splits at
+/// semicolons. That is useful for ordinary statements, but after a failed
+/// whole-buffer parse it can tear a T-SQL procedure or control-flow block into
+/// invalid fragments. Merge those fragments back into balanced blocks before
+/// retrying them individually; never suppress a real parser error.
+fn parse_mssql_ranges_best_effort<'a>(
+    ctx: &ParseContext<'a>,
+    statement_ranges: Vec<Range<usize>>,
+) -> (Vec<StatementInput<'a>>, Vec<Issue>) {
+    parse_statement_ranges_best_effort(ctx, statement_ranges)
 }
 
-fn compute_statement_ranges_for_dialect(sql: &str, dialect: Dialect) -> Vec<Range<usize>> {
-    let ranges = compute_statement_ranges(sql);
-    if !matches!(dialect, Dialect::Mssql) {
-        return ranges;
-    }
-    split_ranges_on_mssql_go_separators(sql, ranges)
-}
+fn merge_mssql_block_ranges(
+    sql: &str,
+    ranges: Vec<Range<usize>>,
+    go_ranges: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    let mut block_depth = 0usize;
+    let mut batch_index = 0usize;
+    let mut go_index = 0usize;
+    let mut current_range_has_block = false;
 
-fn split_ranges_on_mssql_go_separators(sql: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    let go_line_ranges = mssql_go_line_ranges(sql);
-    if go_line_ranges.is_empty() {
-        return ranges;
-    }
-
-    let mut out = Vec::new();
     for range in ranges {
-        let mut cursor = range.start;
-        for go_range in &go_line_ranges {
-            if go_range.end <= cursor || go_range.start >= range.end {
-                continue;
-            }
-            let separator_start = go_range.start.max(cursor);
-            if let Some(chunk) = trim_statement_range(sql, cursor, separator_start) {
-                out.push(chunk);
-            }
-            cursor = go_range.end.min(range.end);
+        while go_index < go_ranges.len() && go_ranges[go_index].end <= range.start {
+            go_index += 1;
+        }
+        let next_batch_index = go_index;
+        if next_batch_index != batch_index {
+            block_depth = 0;
+            batch_index = next_batch_index;
+            current_range_has_block = false;
         }
 
-        if let Some(chunk) = trim_statement_range(sql, cursor, range.end) {
-            out.push(chunk);
+        let text = &sql[range.clone()];
+        let block_depth_before = block_depth;
+        let next_block_depth = mssql_update_block_depth(text, block_depth);
+        let begins_block = next_block_depth > block_depth_before;
+
+        if let Some(current) = merged.last_mut() {
+            if block_depth > 0 && current_range_has_block && batch_index == next_batch_index {
+                current.end = range.end;
+                current_range_has_block |= begins_block;
+            } else {
+                merged.push(range);
+                current_range_has_block = begins_block;
+            }
+        } else {
+            merged.push(range);
+            current_range_has_block = begins_block;
         }
+
+        block_depth = next_block_depth;
     }
 
-    out
+    merged
 }
 
-fn mssql_go_line_ranges(sql: &str) -> Vec<Range<usize>> {
+fn mssql_update_block_depth(sql: &str, mut block_depth: usize) -> usize {
     let mut tokenizer = Tokenizer::new(&MsSqlDialect {}, sql);
     let Ok(tokens) = tokenizer.tokenize_with_location() else {
-        return Vec::new();
+        return block_depth;
     };
 
-    let mut go_lines = Vec::new();
-    for token in tokens {
-        let Token::Word(word) = token.token else {
+    let mut case_depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
             continue;
         };
-        if !word.value.eq_ignore_ascii_case("GO") {
+        if word.quote_style.is_some() {
             continue;
         }
-        let line = token.span.start.line as usize;
-        if line_is_go_separator(sql, line) {
-            go_lines.push(line);
+        if word.value.eq_ignore_ascii_case("CASE") {
+            case_depth += 1;
+        } else if word.value.eq_ignore_ascii_case("END") {
+            if case_depth > 0 {
+                case_depth -= 1;
+            } else if !mssql_word_follows(&tokens, index, "CONVERSATION") {
+                block_depth = block_depth.saturating_sub(1);
+            }
+        } else if word.value.eq_ignore_ascii_case("BEGIN")
+            && !mssql_word_follows_any(
+                &tokens,
+                index,
+                &[
+                    "TRAN",
+                    "TRANSACTION",
+                    "DIALOG",
+                    "DISTRIBUTED",
+                    "CONVERSATION",
+                ],
+            )
+        {
+            block_depth += 1;
         }
     }
+    block_depth
+}
 
-    if go_lines.is_empty() {
-        return Vec::new();
+fn mssql_word_follows(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    index: usize,
+    expected: &str,
+) -> bool {
+    mssql_word_follows_any(tokens, index, &[expected])
+}
+
+fn mssql_word_follows_any(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    index: usize,
+    expected: &[&str],
+) -> bool {
+    tokens[index + 1..]
+        .iter()
+        .find_map(|token| match &token.token {
+            Token::Whitespace(_) => None,
+            Token::Word(word) if word.quote_style.is_none() => Some(word.value.as_str()),
+            Token::Word(_) => Some(""),
+            _ => Some(""),
+        })
+        .is_some_and(|next| expected.iter().any(|word| next.eq_ignore_ascii_case(word)))
+}
+
+pub(crate) fn split_statement_spans_with_dialect(
+    sql: &str,
+    dialect: Dialect,
+) -> Result<Vec<Span>, ()> {
+    compute_statement_ranges_for_dialect(sql, dialect).map(|ranges| {
+        ranges
+            .into_iter()
+            .map(|range| Span::new(range.start, range.end))
+            .collect()
+    })
+}
+
+fn compute_statement_ranges_for_dialect(
+    sql: &str,
+    dialect: Dialect,
+) -> Result<Vec<Range<usize>>, ()> {
+    compute_statement_ranges_for_dialect_with_limit(
+        sql,
+        dialect,
+        MAX_MSSQL_EXPANDED_STATEMENT_RANGES,
+    )
+}
+
+pub(crate) fn mssql_statement_ranges_without_go(sql: &str) -> Result<Vec<Range<usize>>, ()> {
+    let ranges = compute_statement_ranges_mssql(sql, 0, 0, MAX_MSSQL_EXPANDED_STATEMENT_RANGES)?;
+    Ok(merge_mssql_block_ranges(sql, ranges, &[]))
+}
+
+pub(crate) fn statement_ranges_contain_external_metadata(
+    sql: &str,
+    statement_ranges: &[Range<usize>],
+) -> bool {
+    statement_ranges.iter().any(|range| {
+        sql.get(range.clone()).is_some_and(|statement_sql| {
+            !matches!(parse_external_metadata_statement(statement_sql), Ok(None))
+        })
+    })
+}
+
+fn compute_statement_ranges_for_dialect_with_limit(
+    sql: &str,
+    dialect: Dialect,
+    max_ranges: usize,
+) -> Result<Vec<Range<usize>>, ()> {
+    if !matches!(dialect, Dialect::Mssql) {
+        return Ok(compute_statement_ranges(sql));
+    }
+    let separators = mssql_go_separators(sql)?;
+    let go_ranges: Vec<_> = separators
+        .iter()
+        .map(|separator| separator.range.clone())
+        .collect();
+    let batch_ranges = if separators.is_empty() {
+        compute_statement_ranges_mssql(sql, 0, 0, max_ranges)?
+    } else {
+        split_ranges_on_mssql_go_separators(sql, &separators, max_ranges)?
+    };
+    Ok(merge_mssql_block_ranges(sql, batch_ranges, &go_ranges))
+}
+
+#[derive(Clone, Debug)]
+struct MssqlGoSeparator {
+    range: Range<usize>,
+    repeat_count: usize,
+    comment_depth_after_line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MssqlLexState {
+    Normal,
+    SingleQuote,
+    DoubleQuote,
+    BracketIdentifier,
+    LineComment,
+    BlockComment(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MssqlGoLine {
+    Separator(usize),
+    OverLimit,
+    Invalid,
+}
+
+fn split_ranges_on_mssql_go_separators(
+    sql: &str,
+    separators: &[MssqlGoSeparator],
+    max_ranges: usize,
+) -> Result<Vec<Range<usize>>, ()> {
+    let mut out = Vec::new();
+    let mut batch_start = 0usize;
+    let mut comment_depth = 0usize;
+    for separator in separators {
+        let batch_end = separator.range.start;
+        let batch = sql.get(batch_start..batch_end).unwrap_or_default();
+        let remaining = max_ranges.saturating_sub(out.len());
+        let batch_ranges =
+            compute_statement_ranges_mssql(batch, batch_start, comment_depth, remaining)?;
+        let expanded_count = batch_ranges
+            .len()
+            .checked_mul(separator.repeat_count)
+            .and_then(|count| out.len().checked_add(count));
+        if expanded_count.is_none_or(|count| count > max_ranges) {
+            return Err(());
+        }
+        for _ in 0..separator.repeat_count {
+            out.extend(batch_ranges.iter().cloned());
+        }
+        batch_start = separator.range.end;
+        comment_depth = separator.comment_depth_after_line;
     }
 
-    go_lines.sort_unstable();
-    go_lines.dedup();
-
-    go_lines
-        .into_iter()
-        .filter_map(|line| line_byte_range(sql, line))
-        .collect()
-}
-
-fn line_is_go_separator(sql: &str, line_number: usize) -> bool {
-    line_text(sql, line_number).is_some_and(|line| line.trim().eq_ignore_ascii_case("GO"))
-}
-
-fn line_text(sql: &str, line_number: usize) -> Option<&str> {
-    let range = line_byte_range(sql, line_number)?;
-    let line = &sql[range];
-    Some(line.trim_end_matches(['\n', '\r']))
-}
-
-fn line_byte_range(sql: &str, line_number: usize) -> Option<Range<usize>> {
-    if line_number == 0 {
-        return None;
+    let batch = sql.get(batch_start..).unwrap_or_default();
+    let trailing_ranges = compute_statement_ranges_mssql(
+        batch,
+        batch_start,
+        comment_depth,
+        max_ranges.saturating_sub(out.len()),
+    )?;
+    if out
+        .len()
+        .checked_add(trailing_ranges.len())
+        .is_none_or(|count| count > max_ranges)
+    {
+        return Err(());
     }
+    out.extend(trailing_ranges);
 
+    Ok(out)
+}
+
+fn compute_statement_ranges_mssql(
+    sql: &str,
+    offset: usize,
+    initial_block_comment_depth: usize,
+    max_ranges: usize,
+) -> Result<Vec<Range<usize>>, ()> {
+    let mut ranges =
+        compute_statement_ranges_with_mssql_comment_depth(sql, initial_block_comment_depth);
+    if ranges.len() > max_ranges {
+        return Err(());
+    }
+    for range in &mut ranges {
+        range.start += offset;
+        range.end += offset;
+    }
+    Ok(ranges)
+}
+
+fn mssql_go_separators(sql: &str) -> Result<Vec<MssqlGoSeparator>, ()> {
     let bytes = sql.as_bytes();
-    let mut starts = vec![0usize];
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            starts.push(idx + 1);
+    let mut separators = Vec::new();
+    let mut state = MssqlLexState::Normal;
+    let mut line_start = 0usize;
+
+    while line_start < bytes.len() {
+        let newline = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| line_start + offset);
+        let line_end = newline.unwrap_or(bytes.len());
+        let line_range_end = newline.map_or(bytes.len(), |index| index + 1);
+        let line = sql.get(line_start..line_end).unwrap_or_default();
+
+        let separator_repeat_count = if state == MssqlLexState::Normal {
+            match parse_mssql_go_line(line) {
+                MssqlGoLine::Separator(repeat_count) => Some(repeat_count),
+                MssqlGoLine::OverLimit => return Err(()),
+                MssqlGoLine::Invalid => None,
+            }
+        } else {
+            None
+        };
+
+        scan_mssql_lex_state(bytes, line_start, line_end, &mut state);
+        if newline.is_some() && state == MssqlLexState::LineComment {
+            state = MssqlLexState::Normal;
         }
+        if let Some(repeat_count) = separator_repeat_count {
+            let comment_depth_after_line = match state {
+                MssqlLexState::BlockComment(depth) => depth,
+                _ => 0,
+            };
+            separators.push(MssqlGoSeparator {
+                range: line_start..line_range_end,
+                repeat_count,
+                comment_depth_after_line,
+            });
+            if separators.len() > MAX_MSSQL_GO_SEPARATORS {
+                return Err(());
+            }
+        }
+        line_start = line_range_end;
     }
 
-    let start = *starts.get(line_number - 1)?;
-    let end = starts.get(line_number).copied().unwrap_or(sql.len());
-    Some(start..end)
+    Ok(separators)
+}
+
+fn parse_mssql_go_line(line: &str) -> MssqlGoLine {
+    let line = line
+        .trim_end_matches('\r')
+        .trim_start_matches(char::is_whitespace);
+    let bytes = line.as_bytes();
+    if bytes.len() < 2 || !bytes[..2].eq_ignore_ascii_case(b"GO") {
+        return MssqlGoLine::Invalid;
+    }
+    let mut index = 2usize;
+    if index < bytes.len()
+        && !bytes[index].is_ascii_whitespace()
+        && bytes[index] != b'-'
+        && bytes[index] != b'/'
+    {
+        return MssqlGoLine::Invalid;
+    }
+    skip_ascii_space(bytes, &mut index);
+
+    let count_start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    let mut over_limit = false;
+    let repeat_count = if index > count_start {
+        let count = match std::str::from_utf8(&bytes[count_start..index])
+            .unwrap_or_default()
+            .parse::<usize>()
+        {
+            Ok(count) => count,
+            Err(_) => {
+                over_limit = true;
+                1
+            }
+        };
+        if !over_limit && count == 0 {
+            return MssqlGoLine::Invalid;
+        }
+        if count > MAX_MSSQL_GO_REPEAT {
+            over_limit = true;
+        }
+        if over_limit {
+            1
+        } else {
+            count
+        }
+    } else {
+        1
+    };
+
+    skip_ascii_space(bytes, &mut index);
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"--") {
+            return if over_limit {
+                MssqlGoLine::OverLimit
+            } else {
+                MssqlGoLine::Separator(repeat_count)
+            };
+        }
+        if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            let mut depth = 1usize;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index..].starts_with(b"/*") {
+                    depth = depth.saturating_add(1);
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            if depth > 0 {
+                // A block comment may continue on subsequent lines. The GO line
+                // remains valid, and the lexical scanner carries that comment state.
+                return if over_limit {
+                    MssqlGoLine::OverLimit
+                } else {
+                    MssqlGoLine::Separator(repeat_count)
+                };
+            }
+            skip_ascii_space(bytes, &mut index);
+            continue;
+        }
+        return MssqlGoLine::Invalid;
+    }
+    if over_limit {
+        MssqlGoLine::OverLimit
+    } else {
+        MssqlGoLine::Separator(repeat_count)
+    }
+}
+
+fn skip_ascii_space(bytes: &[u8], index: &mut usize) {
+    while bytes.get(*index).is_some_and(u8::is_ascii_whitespace) {
+        *index += 1;
+    }
+}
+
+fn scan_mssql_lex_state(bytes: &[u8], start: usize, end: usize, state: &mut MssqlLexState) {
+    let mut index = start;
+    while index < end {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match *state {
+            MssqlLexState::Normal => match (byte, next) {
+                (b'-', Some(b'-')) => {
+                    *state = MssqlLexState::LineComment;
+                    index += 2;
+                }
+                (b'/', Some(b'*')) => {
+                    *state = MssqlLexState::BlockComment(1);
+                    index += 2;
+                }
+                (b'\'', _) => {
+                    *state = MssqlLexState::SingleQuote;
+                    index += 1;
+                }
+                (b'"', _) => {
+                    *state = MssqlLexState::DoubleQuote;
+                    index += 1;
+                }
+                (b'[', _) => {
+                    *state = MssqlLexState::BracketIdentifier;
+                    index += 1;
+                }
+                _ => index += 1,
+            },
+            MssqlLexState::SingleQuote => {
+                if byte == b'\'' && next == Some(b'\'') {
+                    index += 2;
+                } else {
+                    if byte == b'\'' {
+                        *state = MssqlLexState::Normal;
+                    }
+                    index += 1;
+                }
+            }
+            MssqlLexState::DoubleQuote => {
+                if byte == b'"' && next == Some(b'"') {
+                    index += 2;
+                } else {
+                    if byte == b'"' {
+                        *state = MssqlLexState::Normal;
+                    }
+                    index += 1;
+                }
+            }
+            MssqlLexState::BracketIdentifier => {
+                if byte == b']' && next == Some(b']') {
+                    index += 2;
+                } else {
+                    if byte == b']' {
+                        *state = MssqlLexState::Normal;
+                    }
+                    index += 1;
+                }
+            }
+            MssqlLexState::LineComment => break,
+            MssqlLexState::BlockComment(depth) => match (byte, next) {
+                (b'/', Some(b'*')) => {
+                    *state = MssqlLexState::BlockComment(depth.saturating_add(1));
+                    index += 2;
+                }
+                (b'*', Some(b'/')) => {
+                    *state = if depth == 1 {
+                        MssqlLexState::Normal
+                    } else {
+                        MssqlLexState::BlockComment(depth - 1)
+                    };
+                    index += 2;
+                }
+                _ => index += 1,
+            },
+        }
+    }
 }
 
 /// Split SQL text into statement ranges by finding semicolons outside of strings/comments.
@@ -766,12 +2080,23 @@ fn line_byte_range(sql: &str, line_number: usize) -> Option<Range<usize>> {
 /// sqlparser, but for now this manual approach provides the most reliable results
 /// for the analysis use cases.
 fn compute_statement_ranges(sql: &str) -> Vec<Range<usize>> {
+    compute_statement_ranges_with_mssql_comment_depth(sql, 0)
+}
+
+fn compute_statement_ranges_with_mssql_comment_depth(
+    sql: &str,
+    initial_block_comment_depth: usize,
+) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     if sql.is_empty() {
         return ranges;
     }
 
-    let mut start = 0usize;
+    let mut start = if initial_block_comment_depth > 0 {
+        None
+    } else {
+        Some(0usize)
+    };
     let mut i = 0usize;
     let len = sql.len();
 
@@ -780,7 +2105,7 @@ fn compute_statement_ranges(sql: &str) -> Vec<Range<usize>> {
     let mut in_backtick = false;
     let mut in_bracket = false;
     let mut in_line_comment = false;
-    let mut in_block_comment = false;
+    let mut block_comment_depth = initial_block_comment_depth;
     let mut dollar_delimiter: Option<String> = None;
 
     while i < len {
@@ -804,10 +2129,16 @@ fn compute_statement_ranges(sql: &str) -> Vec<Range<usize>> {
             continue;
         }
 
-        if in_block_comment {
-            if starts_with_at(sql, i, "*/") {
+        if block_comment_depth > 0 {
+            if starts_with_at(sql, i, "/*") {
                 i += 2;
-                in_block_comment = false;
+                block_comment_depth = block_comment_depth.saturating_add(1);
+            } else if starts_with_at(sql, i, "*/") {
+                i += 2;
+                block_comment_depth -= 1;
+                if block_comment_depth == 0 && start.is_none() {
+                    start = Some(i);
+                }
             } else {
                 let (_, advance) = next_char(sql, i);
                 i += advance;
@@ -916,7 +2247,7 @@ fn compute_statement_ranges(sql: &str) -> Vec<Range<usize>> {
                 continue;
             }
             '/' if starts_with_at(sql, i + advance, "*") => {
-                in_block_comment = true;
+                block_comment_depth = 1;
                 i += advance + 1;
                 continue;
             }
@@ -928,8 +2259,10 @@ fn compute_statement_ranges(sql: &str) -> Vec<Range<usize>> {
                 }
             }
             ';' => {
-                push_statement_range(&mut ranges, sql, start, i);
-                start = i + advance;
+                if let Some(statement_start) = start {
+                    push_statement_range(&mut ranges, sql, statement_start, i);
+                }
+                start = Some(i + advance);
             }
             _ => {}
         }
@@ -937,7 +2270,9 @@ fn compute_statement_ranges(sql: &str) -> Vec<Range<usize>> {
         i += advance;
     }
 
-    push_statement_range(&mut ranges, sql, start, len);
+    if let Some(statement_start) = start {
+        push_statement_range(&mut ranges, sql, statement_start, len);
+    }
     ranges
 }
 
@@ -1078,6 +2413,7 @@ fn skip_block_comment(bytes: &[u8], mut index: usize, end: usize) -> usize {
 mod tests {
     use super::*;
     use crate::types::{Dialect, FileSource};
+    use sqlparser::ast::{SetExpr, TableFactor};
 
     fn base_request() -> AnalyzeRequest {
         AnalyzeRequest {
@@ -1090,6 +2426,542 @@ mod tests {
             #[cfg(feature = "templating")]
             template_config: None,
         }
+    }
+
+    #[test]
+    fn mssql_synapse_openrowset_parsing_preserves_ast_and_source_offsets() {
+        let sql = concat!(
+            "-- café\r\n",
+            "SELECT file.id FROM OPENROWSET(",
+            "BULK 'https://storage.example/container/*.parquet', ",
+            "DATA_SOURCE = 'lake', FORMAT = 'PARQUET'",
+            ") AS [file]"
+        );
+        assert!(
+            parse_sql_with_dialect_output(sql, Dialect::Mssql).is_err(),
+            "the upstream MSSQL parser currently rejects Synapse's OPENROWSET option syntax"
+        );
+
+        let compatible_sql =
+            mssql_openrowset_compatible_sql(sql).expect("recognized Synapse OPENROWSET syntax");
+        assert_eq!(compatible_sql.len(), sql.len());
+        assert_eq!(
+            compatible_sql.matches('\n').count(),
+            sql.matches('\n').count()
+        );
+        assert_eq!(
+            compatible_sql.matches('\r').count(),
+            sql.matches('\r').count()
+        );
+        let path = "'https://storage.example/container/*.parquet'";
+        let path_start = sql.find(path).expect("path literal");
+        assert_eq!(
+            &compatible_sql[path_start..path_start + path.len()],
+            path,
+            "one-byte rewrites must leave every source token at the same byte offset"
+        );
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse with bounded Synapse syntax adaptation");
+        assert!(output.parser_fallback_used);
+        assert_eq!(output.statements.len(), 1);
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        let TableFactor::Table {
+            name,
+            args: Some(args),
+            alias: Some(alias),
+            ..
+        } = &select.from[0].relation
+        else {
+            panic!("expected OPENROWSET table-valued function");
+        };
+        assert_eq!(name.to_string(), "OPENROWSET");
+        assert_eq!(alias.name.value, "file");
+        assert_eq!(
+            args.args
+                .iter()
+                .map(|argument| match argument {
+                    sqlparser::ast::FunctionArg::ExprNamed {
+                        name: sqlparser::ast::Expr::Identifier(name),
+                        operator: sqlparser::ast::FunctionArgOperator::Colon,
+                        ..
+                    } => name.value.to_ascii_uppercase(),
+                    other => panic!("expected preserved named argument, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "BULK".to_string(),
+                "DATA_SOURCE".to_string(),
+                "FORMAT".to_string(),
+            ]
+        );
+
+        let csv_sql = concat!(
+            "SELECT csv_row.id FROM OPENROWSET(",
+            "BULK 'https://storage.example/container/*.csv', ",
+            "FORMAT = 'CSV', PARSER_VERSION = '2.0', HEADER_ROW = TRUE, ",
+            "FIELDTERMINATOR = '|'",
+            ") AS csv_row"
+        );
+        let csv_output = parse_input_sql_with_dialect_output(csv_sql, Dialect::Mssql)
+            .expect("parse canonical Synapse CSV OPENROWSET");
+        assert_eq!(csv_output.statements.len(), 1);
+        assert!(csv_output.parser_fallback_used);
+    }
+
+    #[test]
+    fn mssql_synapse_openrowset_rejects_data_source_after_format() {
+        let sql =
+            "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 'lake') AS r";
+
+        assert!(mssql_openrowset_compatible_sql(sql).is_none());
+        let error = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .err()
+            .expect("DATA_SOURCE-after-FORMAT is outside the documented Synapse grammar");
+        assert!(error.position.is_some());
+        assert_eq!(
+            error.position,
+            parse_sql_with_dialect_output(sql, Dialect::Mssql)
+                .err()
+                .expect("the upstream parser rejects the documented-invalid order")
+                .position,
+            "the MSSQL adapter must preserve the original parser diagnostic location"
+        );
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_string();
+        let result = crate::analyzer::analyze(&request);
+        let parse_issue = result
+            .issues
+            .iter()
+            .find(|issue| issue.code == issue_codes::PARSE_ERROR)
+            .expect("invalid option ordering remains a parser diagnostic");
+        assert_eq!(parse_issue.span, Some(Span::new(0, sql.len())));
+
+        assert_eq!(
+            parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            parse_input_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            "the MSSQL adapter must not change generic-dialect parsing"
+        );
+    }
+
+    #[test]
+    fn mssql_synapse_openrowset_preserves_observed_csv_options() {
+        let sql = concat!(
+            "-- café\r\n",
+            "SELECT records.record_id FROM OPENROWSET(\r\n",
+            "  BULK N'https://example.invalid/records/*.csv',\r\n",
+            "  FORMAT = 'CSV', PARSER_VERSION = '2.0', FIRSTROW = 2,\r\n",
+            "  FIELDQUOTE = '\"', ROWTERMINATOR = '0x0A',\r\n",
+            "  ROWSET_OPTIONS = '{\"READ_OPTIONS\":[\"ALLOW_INCONSISTENT_READS\"]}'\r\n",
+            ") AS records"
+        );
+        let compatible_sql =
+            mssql_openrowset_compatible_sql(sql).expect("recognized Synapse CSV options");
+        assert_eq!(compatible_sql.len(), sql.len());
+        assert_eq!(
+            compatible_sql.matches('\n').count(),
+            sql.matches('\n').count()
+        );
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse CSV rowset options");
+        assert!(output.parser_fallback_used);
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        let TableFactor::Table {
+            args: Some(args), ..
+        } = &select.from[0].relation
+        else {
+            panic!("expected OPENROWSET table factor");
+        };
+        let argument_names: Vec<_> = args
+            .args
+            .iter()
+            .map(|argument| match argument {
+                sqlparser::ast::FunctionArg::ExprNamed {
+                    name: sqlparser::ast::Expr::Identifier(name),
+                    operator: sqlparser::ast::FunctionArgOperator::Colon,
+                    ..
+                } => name.value.to_ascii_uppercase(),
+                other => panic!("expected preserved named argument, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            argument_names,
+            [
+                "BULK",
+                "FORMAT",
+                "PARSER_VERSION",
+                "FIRSTROW",
+                "FIELDQUOTE",
+                "ROWTERMINATOR",
+                "ROWSET_OPTIONS",
+            ]
+        );
+
+        let malformed =
+            "SELECT r.id FROM OPENROWSET(BULK 'data.csv', FORMAT = 'CSV', ROWSET_OPTIONS = TRUE) AS r";
+        assert!(mssql_openrowset_compatible_sql(malformed).is_none());
+        let error = parse_input_sql_with_dialect_output(malformed, Dialect::Mssql)
+            .err()
+            .expect("non-string ROWSET_OPTIONS must remain invalid");
+        assert!(error.position.is_some());
+
+        assert_eq!(
+            parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            parse_input_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            "the MSSQL-only adapter must not change generic-dialect parsing"
+        );
+    }
+
+    #[test]
+    fn mssql_synapse_openrowset_supports_multiple_sources_and_delta_format() {
+        let sql = concat!(
+            "SELECT csv_row.item_id, delta_row.item_id FROM OPENROWSET(",
+            "BULK 'https://example.invalid/csv/*.csv', FORMAT = 'CSV'",
+            ") WITH (item_id INT 1) AS csv_row ",
+            "JOIN OPENROWSET(",
+            "BULK 'https://example.invalid/delta/*.parquet', FORMAT = 'DELTA'",
+            ") WITH (item_id BIGINT 1) AS delta_row ",
+            "ON csv_row.item_id = delta_row.item_id"
+        );
+        let compatible_sql =
+            mssql_openrowset_compatible_sql(sql).expect("adapt both external rowsets");
+        assert_eq!(compatible_sql.len(), sql.len());
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse multiple CSV and Delta rowsets");
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        let TableFactor::Table {
+            alias: Some(csv_alias),
+            ..
+        } = &select.from[0].relation
+        else {
+            panic!("expected first OPENROWSET factor");
+        };
+        assert_eq!(csv_alias.name.value, "csv_row");
+        assert_eq!(
+            csv_alias.columns[0]
+                .data_type
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("INT")
+        );
+
+        let TableFactor::Table {
+            alias: Some(delta_alias),
+            ..
+        } = &select.from[0].joins[0].relation
+        else {
+            panic!("expected joined OPENROWSET factor");
+        };
+        assert_eq!(delta_alias.name.value, "delta_row");
+        assert_eq!(
+            delta_alias.columns[0]
+                .data_type
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("BIGINT")
+        );
+    }
+
+    #[test]
+    fn mssql_synapse_openrowset_schema_is_preserved_as_alias_columns() {
+        let sql = concat!(
+            "-- café\r\n",
+            "SELECT src.order_id, src.customer_name FROM OPENROWSET(",
+            "BULK N'https://storage.example/container/*.csv', ",
+            "FORMAT = 'CSV', HEADER_ROW = TRUE",
+            ") /* keep comments outside the schema */ WITH (\r\n",
+            "  -- CSV ordinal and JSON path are source metadata.\n",
+            "  [order_id] BIGINT 1,\n",
+            "  [customer_name] VARCHAR(128) '$.customerName'\n",
+            ") AS [src]"
+        );
+        let compatible_sql =
+            mssql_openrowset_compatible_sql(sql).expect("recognized schema-bearing OPENROWSET");
+        assert_eq!(compatible_sql.len(), sql.len());
+        assert_eq!(
+            compatible_sql.matches('\n').count(),
+            sql.matches('\n').count()
+        );
+        assert_eq!(
+            compatible_sql.matches('\r').count(),
+            sql.matches('\r').count()
+        );
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse schema-bearing Synapse OPENROWSET");
+        assert!(output.parser_fallback_used);
+        let Statement::Query(query) = &output.statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        let TableFactor::Table {
+            alias: Some(alias), ..
+        } = &select.from[0].relation
+        else {
+            panic!("expected OPENROWSET table factor with alias");
+        };
+        assert_eq!(alias.name.value, "src");
+        assert_eq!(
+            alias
+                .columns
+                .iter()
+                .map(|column| column.name.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["order_id", "customer_name"]
+        );
+        assert_eq!(
+            alias.columns[0]
+                .data_type
+                .as_ref()
+                .expect("declared type")
+                .to_string(),
+            "BIGINT"
+        );
+        assert_eq!(
+            alias.columns[1]
+                .data_type
+                .as_ref()
+                .expect("declared type")
+                .to_string(),
+            "VARCHAR(128)"
+        );
+    }
+
+    #[test]
+    fn mssql_openrowset_adapter_does_not_accept_unrecognized_or_malformed_forms() {
+        let unknown_option = "SELECT * FROM OPENROWSET(BULK 'path', UNKNOWN_OPTION = 'x') AS file";
+        assert!(
+            mssql_openrowset_compatible_sql(unknown_option).is_none(),
+            "unknown options must not be rewritten into parser-supported arguments"
+        );
+
+        for sql in [
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'TEXT') AS file",
+            unknown_option,
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'PARQUET', FORMAT = 'CSV') AS file",
+            "SELECT * FROM OPENROWSET(BULK 'path' + 'other', FORMAT = 'PARQUET') AS file",
+            "SELECT OPENROWSET(BULK 'path', FORMAT = 'PARQUET')",
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = ) AS file",
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH () AS file",
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id) AS file",
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT DEFAULT 1) AS file",
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT 0) AS file",
+            "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT,) AS file",
+        ] {
+            assert!(
+                parse_input_sql_with_dialect_output(sql, Dialect::Mssql).is_err(),
+                "unsupported or malformed syntax must remain a parser error: {sql}"
+            );
+            assert!(
+                mssql_openrowset_compatible_sql(sql).is_none(),
+                "malformed schema syntax must not be rewritten: {sql}"
+            );
+        }
+
+        let non_target_parse_error =
+            "SELECT FROM OPENROWSET(BULK 'path', FORMAT = 'PARQUET') AS file";
+        assert!(
+            mssql_openrowset_compatible_sql(non_target_parse_error).is_some(),
+            "the documented OPENROWSET arguments should still be recognized"
+        );
+        assert!(
+            parse_input_sql_with_dialect_output(non_target_parse_error, Dialect::Mssql).is_err(),
+            "rewriting OPENROWSET must not hide unrelated SQL parse errors"
+        );
+        let parse_error_without_openrowset = "SELECT FROM dbo.source";
+        assert!(mssql_openrowset_compatible_sql(parse_error_without_openrowset).is_none());
+        assert!(
+            parse_input_sql_with_dialect_output(parse_error_without_openrowset, Dialect::Mssql)
+                .is_err(),
+            "non-target MSSQL syntax must remain a parser error"
+        );
+
+        let embedded_keyword_sql = concat!(
+            "SELECT 'OPENROWSET(BULK ''path'', FORMAT = ''CSV'') WITH (id INT)' AS sql_text ",
+            "/* OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT) */"
+        );
+        assert!(mssql_openrowset_compatible_sql(embedded_keyword_sql).is_none());
+        let embedded_keyword_output =
+            parse_input_sql_with_dialect_output(embedded_keyword_sql, Dialect::Mssql)
+                .expect("keywords in strings/comments must remain ordinary SQL text");
+        assert!(!embedded_keyword_output.parser_fallback_used);
+
+        let provider_sql = concat!(
+            "SELECT rowset.id FROM OPENROWSET(",
+            "'MSOLEDBSQL', 'Server=server;Trusted_Connection=yes;', ",
+            "'SELECT id FROM dbo.source'",
+            ") AS rowset"
+        );
+        assert!(mssql_openrowset_compatible_sql(provider_sql).is_none());
+        let provider_parse = parse_sql_with_dialect_output(provider_sql, Dialect::Mssql);
+        let provider_adaptation = parse_input_sql_with_dialect_output(provider_sql, Dialect::Mssql);
+        assert_eq!(provider_parse.is_ok(), provider_adaptation.is_ok());
+        if let Ok(output) = provider_adaptation {
+            assert!(!output.parser_fallback_used);
+        }
+    }
+
+    #[test]
+    fn synapse_cetas_parses_with_an_explicit_unsupported_lineage_warning() {
+        let sql = concat!(
+            "CREATE EXTERNAL TABLE [analytics].[daily_rollup] ",
+            "WITH (LOCATION = 'output/daily/', DATA_SOURCE = lake_source, ",
+            "FILE_FORMAT = parquet_format) AS ",
+            "SELECT item_id, 'café' AS label FROM OPENROWSET(",
+            "BULK 'source.parquet', DATA_SOURCE = 'lake', ",
+            "FORMAT = 'PARQUET') AS source_items"
+        );
+        let parsed = parse_input_statement_with_dialect_output(sql, Dialect::Mssql)
+            .expect("documented CETAS syntax should be recognized");
+        assert!(matches!(
+            parsed,
+            InputParseOutput::ExternalMetadata(ExternalMetadataStatement::Cetas(_), true)
+        ));
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+        let result = crate::analyzer::analyze(&request);
+        assert_eq!(result.statements.len(), 1);
+        assert_eq!(
+            result.statements[0].statement_type,
+            "CREATE_EXTERNAL_TABLE_AS_SELECT"
+        );
+        assert_eq!(
+            result.statements[0].span,
+            Some(Span::new(0, sql.len())),
+            "the metadata-only statement span must use original UTF-8 byte offsets"
+        );
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+        let warning = result
+            .issues
+            .iter()
+            .find(|issue| issue.code == issue_codes::UNSUPPORTED_SYNTAX)
+            .expect("explicit external-lineage warning");
+        assert_eq!(warning.severity, crate::types::Severity::Warning);
+        assert_eq!(warning.span, Some(Span::new(0, sql.len())));
+        assert!(warning.message.contains("file-write lineage"));
+        assert!(
+            result
+                .issues
+                .iter()
+                .all(|issue| issue.code != issue_codes::PARSE_ERROR),
+            "recognized CETAS should not be reported as a parser error"
+        );
+
+        let parse_only = crate::analyzer::parse_only_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse-only CETAS");
+        assert_eq!(parse_only.statement_count, 1);
+        assert!(
+            parse_only.parser_fallback_used,
+            "nested OPENROWSET adaptation is included in parse-only fallback accounting"
+        );
+
+        let malformed_options = concat!(
+            "CREATE EXTERNAL TABLE target WITH (LOCATION = 'out/', ",
+            "DATA_SOURCE = lake_source, FILE_FORMAT = ) AS SELECT 1"
+        );
+        let error = parse_input_statement_with_dialect_output(malformed_options, Dialect::Mssql)
+            .err()
+            .expect("malformed CETAS metadata must remain a parser error")
+            .into_parse_error();
+        assert!(error.position.is_some());
+        assert_eq!(error.dialect, Some(Dialect::Mssql));
+
+        let reordered_options = concat!(
+            "CREATE EXTERNAL TABLE target WITH (DATA_SOURCE = lake_source, ",
+            "LOCATION = 'out/', FILE_FORMAT = parquet_format) AS SELECT 1"
+        );
+        assert!(
+            parse_input_statement_with_dialect_output(reordered_options, Dialect::Mssql).is_err(),
+            "CETAS options must follow the documented LOCATION/DATA_SOURCE/FILE_FORMAT order"
+        );
+
+        let malformed_query = concat!(
+            "CREATE EXTERNAL TABLE target WITH (LOCATION = 'out/', ",
+            "DATA_SOURCE = lake_source, FILE_FORMAT = parquet_format) ",
+            "AS SELECT 'café' AS label FROM )"
+        );
+        let query_error =
+            parse_input_statement_with_dialect_output(malformed_query, Dialect::Mssql)
+                .err()
+                .expect("malformed CETAS must remain a parser error")
+                .into_parse_error();
+        let query_error_position = query_error.position.expect("original query position");
+        assert_eq!(query_error.dialect, Some(Dialect::Mssql));
+        assert!(
+            query_error_position.column > malformed_query.find(" AS SELECT").expect("CETAS query"),
+            "query diagnostics must include the original CETAS prefix offset"
+        );
+        assert!(
+            !query_error.message.contains(" at Line:"),
+            "query diagnostics must not retain query-fragment coordinates"
+        );
+        let query_sql = "SELECT 'café' AS label FROM )";
+        let fragment_error = parse_input_sql_with_dialect_output(query_sql, Dialect::Mssql)
+            .err()
+            .expect("the SELECT fragment is malformed");
+        let fragment_position = fragment_error.position.expect("fragment error position");
+        let fragment_offset = crate::analyzer::helpers::line_col_to_offset(
+            query_sql,
+            fragment_position.line,
+            fragment_position.column,
+        )
+        .expect("fragment error offset");
+        let query_offset = malformed_query.find(query_sql).expect("query offset");
+        assert_eq!(
+            Some(offset_to_position(&malformed_query, query_offset + fragment_offset).unwrap()),
+            Some(query_error_position),
+            "query diagnostic location must map to the original UTF-8 source"
+        );
+
+        let extra_query = concat!(
+            "CREATE EXTERNAL TABLE target WITH (LOCATION = 'out/', ",
+            "DATA_SOURCE = lake_source, FILE_FORMAT = parquet_format) ",
+            "AS SELECT 1; SELECT 2"
+        );
+        assert!(
+            parse_input_statement_with_dialect_output(extra_query, Dialect::Mssql).is_err(),
+            "CETAS accepts exactly one SELECT statement after AS"
+        );
+        let non_select_query = concat!(
+            "CREATE EXTERNAL TABLE target WITH (LOCATION = 'out/', ",
+            "DATA_SOURCE = lake_source, FILE_FORMAT = parquet_format) AS VALUES (1)"
+        );
+        assert!(
+            parse_input_statement_with_dialect_output(non_select_query, Dialect::Mssql).is_err(),
+            "CETAS requires a SELECT query, not a VALUES expression"
+        );
+
+        assert_eq!(
+            parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            parse_input_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            "CETAS recognition must remain MSSQL-only"
+        );
     }
 
     #[test]
@@ -1166,6 +3038,27 @@ mod tests {
     }
 
     #[test]
+    fn mssql_expansion_budget_is_shared_across_sources_and_attributed() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.files = Some(vec![
+            FileSource {
+                name: "first.sql".to_string(),
+                content: format!("SELECT 1;\nGO {}\n", MAX_MSSQL_GO_REPEAT),
+            },
+            FileSource {
+                name: "second.sql".to_string(),
+                content: "SELECT 2;".to_string(),
+            },
+        ]);
+        let (statements, issues) = collect_statements(&request);
+        assert_eq!(statements.len(), MAX_MSSQL_GO_REPEAT);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::INVALID_REQUEST);
+        assert_eq!(issues[0].source_name.as_deref(), Some("second.sql"));
+    }
+
+    #[test]
     fn reports_invalid_request_without_inputs() {
         let request = base_request();
         let (_statements, issues) = collect_statements(&request);
@@ -1190,6 +3083,9 @@ mod tests {
         assert_eq!(&sql[ranges[0].clone()], "SELECT 1");
         assert_eq!(&sql[ranges[1].clone()], "SELECT 2");
         assert_eq!(&sql[ranges[2].clone()], "SELECT 3");
+        assert!(ranges
+            .iter()
+            .all(|range| !sql[range.clone()].contains("comment")));
     }
 
     #[test]
@@ -1207,7 +3103,7 @@ mod tests {
     #[test]
     fn mssql_statement_ranges_split_go_batch_separators() {
         let sql = "CREATE SCHEMA staging;\nGO\nCREATE TABLE test (id INT)\n";
-        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql);
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
         assert_eq!(ranges.len(), 2);
         assert_eq!(&sql[ranges[0].clone()], "CREATE SCHEMA staging");
         assert_eq!(&sql[ranges[1].clone()], "CREATE TABLE test (id INT)");
@@ -1220,7 +3116,7 @@ mod tests {
             "SELECT 1;\r\n  go  \r\nSELECT 2;\r\nGO\r\n",
             "SELECT 1\nGO\nGO\nSELECT 2\nGO\n",
         ] {
-            let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql);
+            let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
             assert_eq!(ranges.len(), 2, "unexpected ranges for {sql:?}");
             assert_eq!(&sql[ranges[0].clone()], "SELECT 1");
             assert_eq!(&sql[ranges[1].clone()], "SELECT 2");
@@ -1228,14 +3124,173 @@ mod tests {
     }
 
     #[test]
+    fn mssql_statement_ranges_support_go_comments_and_repeat_counts() {
+        let sql = "SELECT 1;\nGO -- batch separator\nSELECT 2;\nGO 2\nSELECT 3;";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(&sql[ranges[0].clone()], "SELECT 1");
+        assert_eq!(&sql[ranges[1].clone()], "SELECT 2");
+        assert_eq!(&sql[ranges[2].clone()], "SELECT 2");
+        assert_eq!(&sql[ranges[3].clone()], "SELECT 3");
+        assert_eq!(
+            ranges[1], ranges[2],
+            "repeated batch spans point to original source bytes"
+        );
+    }
+
+    #[test]
+    fn mssql_go_separator_accepts_trailing_block_comments() {
+        let sql = "SELECT 1;\r\n  GO 2 /* repeat twice */  \r\nSELECT 2;\r\nGO /* next batch */\r\nSELECT 3;";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(&sql[ranges[0].clone()], "SELECT 1");
+        assert_eq!(&sql[ranges[1].clone()], "SELECT 1");
+        assert_eq!(ranges[0], ranges[1]);
+        assert_eq!(&sql[ranges[2].clone()], "SELECT 2");
+        assert_eq!(&sql[ranges[3].clone()], "SELECT 3");
+    }
+
+    #[test]
+    fn mssql_go_separator_preserves_multiline_trailing_comment_state() {
+        let sql = "SELECT 1;\nGO /* comment starts\n; GO\n/* nested */ still comment */\nSELECT 2;\nGO\nSELECT 3;";
+        let separators = mssql_go_separators(sql).unwrap();
+        assert_eq!(separators.len(), 2);
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(&sql[ranges[0].clone()], "SELECT 1");
+        assert_eq!(&sql[ranges[1].clone()], "SELECT 2");
+        assert_eq!(&sql[ranges[2].clone()], "SELECT 3");
+    }
+
+    #[test]
+    fn mssql_statement_ranges_ignore_semicolons_in_nested_block_comments() {
+        for sql in [
+            "SELECT 1 /* outer /* inner; */ outer; */; SELECT 2;",
+            "SELECT 1;\nGO\nSELECT 2 /* outer /* inner; */ outer; */;\nGO\nSELECT 3;",
+        ] {
+            let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+            let statements: Vec<_> = ranges
+                .iter()
+                .map(|range| sql[range.clone()].trim())
+                .collect();
+            assert_eq!(statements.len(), if sql.contains("GO") { 3 } else { 2 });
+            assert!(statements.iter().all(|statement| !statement.is_empty()));
+        }
+    }
+
+    #[test]
+    fn mssql_go_only_and_consecutive_empty_batches_produce_no_statements() {
+        for sql in ["GO\n", "\nGO\nGO\n", "GO 2 -- repeat empty batch\r\nGO\r\n"] {
+            assert!(
+                compute_statement_ranges_for_dialect(sql, Dialect::Mssql)
+                    .unwrap()
+                    .is_empty(),
+                "empty batch should not become a statement: {sql:?}"
+            );
+        }
+        let sql = "GO\nSELECT 1;\nGO\nGO\nSELECT 2;\nGO\n";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(&sql[ranges[0].clone()], "SELECT 1");
+        assert_eq!(&sql[ranges[1].clone()], "SELECT 2");
+    }
+
+    #[test]
+    fn mssql_go_rejects_malformed_and_unbounded_repeat_suffixes() {
+        for suffix in ["0", "-1", "abc", "2 extra"] {
+            let sql = format!("SELECT 1;\nGO {suffix}\nSELECT 2;");
+            let ranges = compute_statement_ranges_for_dialect(&sql, Dialect::Mssql).unwrap();
+            assert_eq!(ranges.len(), 2, "invalid GO suffix split a batch: {suffix}");
+            assert!(sql[ranges[1].clone()].contains("GO"));
+        }
+        for suffix in ["1001", "18446744073709551616"] {
+            let sql = format!("SELECT 1;\nGO {suffix}\nSELECT 2;");
+            assert!(compute_statement_ranges_for_dialect(&sql, Dialect::Mssql).is_err());
+        }
+    }
+
+    #[test]
+    fn mssql_go_scanner_recovers_after_lexically_invalid_prior_batch() {
+        let sql = "SELECT \0;\nGO\nSELECT 2;\nGO\nSELECT 3;";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert!(sql[ranges[0].clone()].contains('\0'));
+        assert_eq!(&sql[ranges[1].clone()], "SELECT 2");
+        assert_eq!(&sql[ranges[2].clone()], "SELECT 3");
+    }
+
+    #[test]
+    fn mssql_go_scanner_ignores_multiline_comments_and_preserves_utf8_byte_ranges() {
+        let sql = "-- café\r\n/* outer\r\nGO\r\n*/\r\nSELECT 1;\r\nGO 2 -- repeat\r\nSELECT FROM;";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert!(sql[ranges[0].clone()].ends_with("SELECT 1"));
+        assert_eq!(ranges[0], ranges[1]);
+        assert_eq!(&sql[ranges[2].clone()], "SELECT FROM");
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+        let (_, issues) = collect_statements(&request);
+        let parse_issue = issues
+            .iter()
+            .find(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            })
+            .expect("malformed later batch should retain its parse issue");
+        let span = parse_issue.span.expect("parse issue span");
+        assert_eq!(
+            &request.sql[span.start..span.end],
+            "SELECT FROM",
+            "unexpected issue span: {parse_issue:?}"
+        );
+    }
+
+    #[test]
+    fn mssql_statement_ranges_do_not_treat_invalid_go_suffix_as_separator() {
+        let sql = "SELECT 1;\nGO 0\nSELECT 2;\nGO abc\nSELECT 3;";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+
+        assert_eq!(ranges.len(), 3);
+        assert!(ranges
+            .iter()
+            .any(|range| sql[range.clone()].contains("GO 0")));
+        assert!(ranges
+            .iter()
+            .any(|range| sql[range.clone()].contains("GO abc")));
+        assert!(sql[ranges[2].clone()].contains("SELECT 3"));
+    }
+
+    #[test]
     fn mssql_statement_ranges_ignore_go_inside_strings_comments_and_identifiers() {
         let sql = "SELECT 'GO' AS literal;\nSELECT [GO] FROM [source];\n-- GO\n/* GO */\nGO\nSELECT 'inside\nGO\nstring' AS literal;";
-        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql);
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
 
         assert_eq!(ranges.len(), 3);
         assert_eq!(&sql[ranges[0].clone()], "SELECT 'GO' AS literal");
         assert_eq!(&sql[ranges[1].clone()], "SELECT [GO] FROM [source]");
         assert!(sql[ranges[2].clone()].contains("inside\nGO\nstring"));
+    }
+
+    #[test]
+    fn non_mssql_statement_splitting_is_unchanged_for_go_lines() {
+        let sql = "SELECT 1;\nGO\nSELECT 2;";
+        let generic = compute_statement_ranges_for_dialect(sql, Dialect::Generic).unwrap();
+        assert_eq!(generic.len(), 2);
+        assert!(generic
+            .iter()
+            .any(|range| sql[range.clone()].contains("GO")));
+    }
+
+    #[test]
+    fn mssql_repeat_expansion_has_a_global_range_budget() {
+        let mut sql = String::new();
+        for _ in 0..=MAX_MSSQL_EXPANDED_STATEMENT_RANGES / MAX_MSSQL_GO_REPEAT {
+            sql.push_str("SELECT 1;\nGO 1000\n");
+        }
+        assert!(compute_statement_ranges_for_dialect(&sql, Dialect::Mssql).is_err());
     }
 
     #[test]
@@ -1268,6 +3323,283 @@ mod tests {
     }
 
     #[test]
+    fn collect_statements_mssql_recovers_complete_begin_end_block() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "CREATE OR ALTER PROCEDURE dbo.p AS BEGIN DECLARE @value INT; SET @value = 1; SELECT @value; END; SELECT FROM;\nGO\nSELECT 2;".to_string();
+
+        let (statements, issues) = collect_statements(&request);
+        let parse_errors: Vec<_> = issues
+            .iter()
+            .filter(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            })
+            .collect();
+
+        assert_eq!(
+            statements.len(),
+            2,
+            "procedure block and following batch should remain separate"
+        );
+        assert_eq!(parse_errors.len(), 1, "unexpected parse errors: {issues:?}");
+        assert!(request.sql[statements[0].source_range.clone()]
+            .contains("CREATE OR ALTER PROCEDURE dbo.p"));
+        assert!(request.sql[statements[0].source_range.clone()].contains("SELECT @value"));
+        assert_eq!(&request.sql[statements[1].source_range.clone()], "SELECT 2");
+    }
+
+    #[test]
+    fn collect_statements_mssql_recovers_nested_if_and_case_blocks() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "-- café\nCREATE OR ALTER PROCEDURE dbo.p AS BEGIN IF 1 = 1 BEGIN DECLARE @value INT; SET @value = CASE WHEN 1 = 1 THEN 10 ELSE 20 END; BEGIN SET @value = @value + 1; END; END ELSE BEGIN SET @value = 0; END; END; SELECT FROM; SELECT 9;".to_owned();
+
+        let (statements, issues) = collect_statements(&request);
+        let parse_errors: Vec<_> = issues
+            .iter()
+            .filter(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            })
+            .collect();
+
+        assert_eq!(
+            statements.len(),
+            2,
+            "unexpected recovered statements: {issues:?}"
+        );
+        assert_eq!(
+            parse_errors.len(),
+            1,
+            "expected only the independent malformed statement"
+        );
+        let procedure = &request.sql[statements[0].source_range.clone()];
+        assert!(procedure.starts_with("CREATE OR ALTER PROCEDURE"));
+        assert!(procedure.ends_with("END"));
+        assert!(procedure.contains("IF 1 = 1"));
+        assert_eq!(&request.sql[statements[1].source_range.clone()], "SELECT 9");
+        let error_span = parse_errors[0].span.expect("parse error span");
+        assert_eq!(
+            &request.sql[error_span.start..error_span.end],
+            "SELECT FROM"
+        );
+    }
+
+    #[test]
+    fn collect_statements_mssql_keeps_bad_block_error_local_and_recovers_later_statement() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql =
+            "CREATE PROCEDURE dbo.p AS BEGIN SELECT 1; SELECT FROM; END; SELECT 2;".to_owned();
+
+        let (statements, issues) = collect_statements(&request);
+        let parse_errors: Vec<_> = issues
+            .iter()
+            .filter(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            })
+            .collect();
+
+        assert_eq!(
+            statements.len(),
+            1,
+            "only the valid later statement should survive"
+        );
+        assert_eq!(&request.sql[statements[0].source_range.clone()], "SELECT 2");
+        assert_eq!(
+            parse_errors.len(),
+            1,
+            "malformed procedure must remain an error"
+        );
+        let span = parse_errors[0].span.expect("procedure error span");
+        assert_eq!(
+            &request.sql[span.start..span.end],
+            "CREATE PROCEDURE dbo.p AS BEGIN SELECT 1; SELECT FROM; END"
+        );
+    }
+
+    #[test]
+    fn mssql_block_scanner_ignores_quoted_keyword_identifiers() {
+        assert_eq!(mssql_update_block_depth("SELECT [BEGIN]", 0), 0);
+        assert_eq!(mssql_update_block_depth("SELECT [END]", 1), 1);
+        assert_eq!(mssql_update_block_depth("SELECT [CASE]; END", 1), 0);
+        assert_eq!(mssql_update_block_depth("BEGIN [TRAN]", 0), 1);
+        assert_eq!(mssql_update_block_depth("END [CONVERSATION]", 1), 0);
+    }
+
+    #[test]
+    fn collect_statements_mssql_quoted_begin_does_not_swallow_neighboring_statements() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "SELECT [BEGIN] FROM t; SELECT FROM; SELECT 3;".to_owned();
+
+        let (statements, issues) = collect_statements(&request);
+        let parse_errors: Vec<_> = issues
+            .iter()
+            .filter(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            })
+            .collect();
+
+        assert_eq!(
+            statements.len(),
+            2,
+            "unexpected recovered statements: {issues:?}"
+        );
+        assert_eq!(
+            &request.sql[statements[0].source_range.clone()],
+            "SELECT [BEGIN] FROM t"
+        );
+        assert_eq!(&request.sql[statements[1].source_range.clone()], "SELECT 3");
+        assert_eq!(
+            parse_errors.len(),
+            1,
+            "the malformed statement must remain an error"
+        );
+        let span = parse_errors[0].span.expect("parse error span");
+        assert_eq!(&request.sql[span.start..span.end], "SELECT FROM");
+    }
+
+    #[test]
+    fn collect_statements_mssql_does_not_count_dynamic_sql_keywords_as_blocks() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "CREATE PROCEDURE dbo.p AS BEGIN DECLARE @sql NVARCHAR(MAX); SET @sql = N'BEGIN; END'; EXEC @sql; SELECT 1; END; SELECT 2;".to_owned();
+
+        let (statements, issues) = collect_statements(&request);
+        assert!(
+            !issues.iter().any(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            }),
+            "dynamic SQL string contents must remain opaque: {issues:?}"
+        );
+        assert_eq!(statements.len(), 2);
+        assert!(request.sql[statements[0].source_range.clone()].contains("EXEC @sql"));
+        assert_eq!(&request.sql[statements[1].source_range.clone()], "SELECT 2");
+    }
+
+    #[test]
+    fn mssql_try_catch_blocks_balance_without_absorbing_following_statements() {
+        let sql = "BEGIN TRY SELECT 1; END TRY BEGIN CATCH SELECT 2; END CATCH; SELECT 3;";
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert!(sql[ranges[0].clone()].starts_with("BEGIN TRY"));
+        assert!(sql[ranges[0].clone()].contains("END CATCH"));
+        assert_eq!(&sql[ranges[1].clone()], "SELECT 3");
+    }
+
+    #[test]
+    fn mssql_non_block_begin_forms_do_not_absorb_later_statements() {
+        for sql in [
+            "BEGIN TRANSACTION; SELECT 1;",
+            "BEGIN DIALOG CONVERSATION @handle FROM SERVICE [source] TO SERVICE 'target' ON CONTRACT [contract]; SELECT 1;",
+            "BEGIN CONVERSATION TIMER (@handle) TIMEOUT = 1000; SELECT 1;",
+        ] {
+            let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql).unwrap();
+            assert_eq!(ranges.len(), 2, "non-block BEGIN expanded a block: {sql}");
+            assert_eq!(&sql[ranges[1].clone()], "SELECT 1");
+        }
+    }
+
+    #[test]
+    fn collect_statements_mssql_keeps_error_for_unbalanced_begin_end_block() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "IF 1 = 1 BEGIN SELECT 1;\nGO\nSELECT 2;".to_string();
+
+        let (statements, issues) = collect_statements(&request);
+        let parse_errors: Vec<_> = issues
+            .iter()
+            .filter(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            })
+            .collect();
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            parse_errors.len(),
+            1,
+            "unbalanced block should remain visible: {issues:?}"
+        );
+        assert!(parse_errors.iter().all(|issue| issue.span.is_some()));
+        assert_eq!(&request.sql[statements[0].source_range.clone()], "SELECT 2");
+    }
+
+    #[test]
+    fn collect_statements_mssql_case_end_is_not_treated_as_block_end() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "CREATE PROCEDURE dbo.p AS BEGIN SELECT CASE WHEN 1 = 1 THEN 2 ELSE 3 END; SELECT 4; END; SELECT 5;".to_string();
+
+        let (_statements, issues) = collect_statements(&request);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+            "CASE END must not close the procedure block: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn collects_external_file_format_as_metadata_only_input() {
+        let sql = concat!(
+            "CREATE EXTERNAL FILE FORMAT csv WITH (FORMAT_TYPE = DELIMITEDTEXT, ",
+            "FORMAT_OPTIONS (FIELD_TERMINATOR = ','));\n",
+            "SELECT 1"
+        );
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_string();
+
+        let (statements, issues) = collect_statements(&request);
+
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+            "valid external metadata should not emit a parse error: {issues:?}"
+        );
+        assert_eq!(statements.len(), 2);
+        assert!(matches!(
+            statements[0].statement,
+            StatementInputKind::ExternalMetadata(_)
+        ));
+        assert!(matches!(
+            statements[1].statement,
+            StatementInputKind::Parsed(_)
+        ));
+        let StatementInputKind::Parsed(parsed_query) = &statements[1].statement else {
+            panic!("expected parsed query");
+        };
+        assert!(matches!(parsed_query.as_ref(), Statement::Query(_)));
+        assert_eq!(statements[0].source_sql.as_ref(), sql);
+        assert!(statements[0].source_sql[statements[0].source_range.clone()]
+            .contains("FIELD_TERMINATOR"));
+    }
+
+    #[test]
+    fn unsupported_external_file_format_remains_a_parse_error() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = "CREATE EXTERNAL FILE FORMAT csv WITH (FORMAT_TYPE = CSV)".to_string();
+
+        let (statements, issues) = collect_statements(&request);
+
+        assert!(statements.is_empty());
+        let parse_issue = issues
+            .iter()
+            .find(|issue| issue.code == issue_codes::PARSE_ERROR)
+            .expect("unsupported file format must report a parse error");
+        assert_eq!(parse_issue.severity, crate::types::Severity::Error);
+        assert!(parse_issue.span.is_some());
+    }
+
+    #[test]
     fn parses_procedure_with_inner_semicolons() {
         let mut request = base_request();
         request.dialect = Dialect::Snowflake;
@@ -1293,6 +3625,13 @@ mod tests {
         );
         assert!(matches!(
             statements[0].statement,
+            StatementInputKind::Parsed(_)
+        ));
+        let StatementInputKind::Parsed(procedure) = &statements[0].statement else {
+            panic!("expected parsed procedure");
+        };
+        assert!(matches!(
+            procedure.as_ref(),
             Statement::CreateProcedure { .. }
         ));
         let procedure_source = &statements[0].source_sql[statements[0].source_range.clone()];
@@ -1300,7 +3639,14 @@ mod tests {
             procedure_source.contains("SELECT 'b';") && procedure_source.contains("RETURN 'done';"),
             "Procedure source should include entire body: {procedure_source:?}"
         );
-        assert!(matches!(statements[1].statement, Statement::Query(_)));
+        assert!(matches!(
+            statements[1].statement,
+            StatementInputKind::Parsed(_)
+        ));
+        let StatementInputKind::Parsed(parsed_query) = &statements[1].statement else {
+            panic!("expected parsed query");
+        };
+        assert!(matches!(parsed_query.as_ref(), Statement::Query(_)));
     }
 
     #[test]

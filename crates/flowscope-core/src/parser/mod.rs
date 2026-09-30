@@ -4,6 +4,8 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+mod mssql_module;
+
 /// Result of parsing SQL with fallback metadata.
 pub struct ParseSqlOutput {
     pub statements: Vec<Statement>,
@@ -27,6 +29,23 @@ pub fn parse_sql_with_dialect_output(
             parser_fallback_used: false,
         }),
         Err(primary_err) => {
+            let mut mssql_adapter_error = None;
+            if matches!(dialect, Dialect::Mssql) {
+                if let Some(adapted_parse) =
+                    mssql_module::parse_compatible_procedure(sql, sqlparser_dialect.as_ref())
+                {
+                    match adapted_parse {
+                        Ok(statements) => {
+                            return Ok(ParseSqlOutput {
+                                statements,
+                                parser_fallback_used: true,
+                            });
+                        }
+                        Err(error) => mssql_adapter_error = Some(error),
+                    }
+                }
+            }
+
             if let Some(sanitized_sql) = sanitize_escaped_identifiers_for_dialect(sql, dialect) {
                 if let Ok(statements) =
                     Parser::parse_sql(sqlparser_dialect.as_ref(), &sanitized_sql)
@@ -86,7 +105,7 @@ pub fn parse_sql_with_dialect_output(
                     });
                 }
             }
-            Err(primary_err.into())
+            Err(mssql_adapter_error.unwrap_or(primary_err).into())
         }
     }
 }

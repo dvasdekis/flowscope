@@ -16,9 +16,17 @@ const harness = `<!doctype html>
   <head><meta charset="utf-8"><title>FlowScope real WASM integration</title></head>
   <body data-status="running">Running FlowScope real WASM integration…</body>
   <script type="module">
-    import init, { analyze_sql_json, get_version } from '/flowscope_wasm.js';
+    import init, { analyze_sql_json, get_version, split_statements_json } from '/flowscope_wasm.js';
 
     const body = document.body;
+    const analyzeMssql = (sql) => JSON.parse(analyze_sql_json(JSON.stringify({
+      sql,
+      dialect: 'mssql',
+    })));
+    const hasIssue = (result, code) => result.issues.some((issue) => issue.code === code);
+    const hasWarning = (result, code) => result.issues.some(
+      (issue) => issue.code === code && issue.severity === 'warning'
+    );
     try {
       await init('/flowscope_wasm_bg.wasm');
       const request = {
@@ -43,13 +51,26 @@ const harness = `<!doctype html>
         .map((node) => node.label);
       const errors = result.issues.filter((issue) => issue.severity === 'error');
 
-      const mssqlRequest = {
-        sql: 'SELECT 1;\nGO\nSELECT 2;\nGO\n',
+      const goSql = 'SELECT 1;\\nGO 2\\nSELECT 2;\\nGO\\n';
+      const mssqlResult = analyzeMssql(goSql);
+      const mssqlSplitResult = JSON.parse(split_statements_json(JSON.stringify({
+        sql: goSql,
         dialect: 'mssql',
-      };
-      const mssqlResult = JSON.parse(analyze_sql_json(JSON.stringify(mssqlRequest)));
-      const mssqlParseErrors = mssqlResult.issues.filter(
-        (issue) => issue.code === 'PARSE_ERROR'
+      })));
+      const moduleSql = "CREATE OR ALTER PROC dbo.copy_rows @source_id INT = 7 OUTPUT, @rows dbo.RowList READONLY AS BEGIN SELECT N'CREATE PROC hidden @x INT OUTPUT'; END";
+      const moduleResult = analyzeMssql(moduleSql);
+      const malformedModuleResult = analyzeMssql(
+        'CREATE OR ALTER PROC dbo.copy_rows @source_id INT, AS SELECT 1;'
+      );
+      const openrowsetSql = "SELECT file.id FROM OPENROWSET(BULK 'https://storage.example/data/*.parquet', FORMAT = 'PARQUET') WITH (id BIGINT) AS file";
+      const synapseResult = analyzeMssql(openrowsetSql);
+      const malformedOpenrowsetResult = analyzeMssql(
+        "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'TEXT') AS file"
+      );
+      const metadataSql = "/* synthetic metadata */ CREATE EXTERNAL FILE FORMAT [synthetic_csv] WITH (FORMAT_TYPE = DELIMITEDTEXT, FORMAT_OPTIONS (FIELD_TERMINATOR = ',', FIRST_ROW = 2))";
+      const metadataResult = analyzeMssql(metadataSql);
+      const malformedMetadataResult = analyzeMssql(
+        "CREATE EXTERNAL FILE FORMAT synthetic_parquet WITH (FORMAT_TYPE = PARQUET, FORMAT_OPTIONS (FIELD_TERMINATOR = ','))"
       );
 
       if (result.statements.length !== 1 || result.summary.statementCount !== 1) {
@@ -61,10 +82,55 @@ const harness = `<!doctype html>
       if (errors.length > 0) {
         throw new Error('Analysis returned errors: ' + JSON.stringify(errors));
       }
-      if (mssqlResult.statements.length !== 2 || mssqlParseErrors.length > 0) {
+      if (mssqlResult.statements.length !== 3 || hasIssue(mssqlResult, 'PARSE_ERROR')) {
         throw new Error(
           'MSSQL GO batch analysis failed: ' + JSON.stringify(mssqlResult.issues)
         );
+      }
+      const goSpans = mssqlSplitResult.statements;
+      if (mssqlSplitResult.error ||
+          goSpans.length !== 3 ||
+          goSpans[0].start !== 0 ||
+          goSpans[0].end !== 8 ||
+          goSpans[1].start !== goSpans[0].start ||
+          goSpans[1].end !== goSpans[0].end ||
+          goSpans[2].start !== 15 ||
+          goSpans[2].end !== 23) {
+        throw new Error('MSSQL GO split ranges changed: ' + JSON.stringify(mssqlSplitResult));
+      }
+      if (moduleResult.statements.length !== 1 ||
+          moduleResult.statements[0].statementType !== 'CREATE_PROCEDURE' ||
+          moduleResult.statements[0].span.start !== 0 ||
+          moduleResult.statements[0].span.end !== moduleSql.length ||
+          moduleResult.nodes.length !== 0 ||
+          moduleResult.edges.length !== 0 ||
+          hasIssue(moduleResult, 'PARSE_ERROR')) {
+        throw new Error('Synapse procedure header analysis failed: ' + JSON.stringify(moduleResult));
+      }
+      if (!hasIssue(malformedModuleResult, 'PARSE_ERROR')) {
+        throw new Error('Malformed Synapse procedure parameters were accepted');
+      }
+      if (synapseResult.statements.length !== 1 ||
+          hasIssue(synapseResult, 'PARSE_ERROR') ||
+          !hasWarning(synapseResult, 'UNSUPPORTED_SYNTAX') ||
+          synapseResult.nodes.some((node) => node.type === 'table')) {
+        throw new Error(
+          'Synapse OPENROWSET analysis failed: ' + JSON.stringify(synapseResult.issues)
+        );
+      }
+      if (!hasIssue(malformedOpenrowsetResult, 'PARSE_ERROR')) {
+        throw new Error('Malformed Synapse OPENROWSET syntax was accepted');
+      }
+      if (metadataResult.statements.length !== 1 ||
+          metadataResult.statements[0].statementType !== 'CREATE_EXTERNAL_FILE_FORMAT' ||
+          metadataResult.nodes.length !== 0 ||
+          metadataResult.edges.length !== 0 ||
+          !hasWarning(metadataResult, 'UNSUPPORTED_SYNTAX') ||
+          hasIssue(metadataResult, 'PARSE_ERROR')) {
+        throw new Error('External metadata was incorrectly analyzed as a table');
+      }
+      if (!hasIssue(malformedMetadataResult, 'PARSE_ERROR')) {
+        throw new Error('Unsupported external file format options were accepted');
       }
 
       body.dataset.status = 'passed';
@@ -73,6 +139,9 @@ const harness = `<!doctype html>
         statementCount: result.summary.statementCount,
         tableLabels,
         mssqlStatementCount: mssqlResult.summary.statementCount,
+        moduleStatementType: moduleResult.statements[0].statementType,
+        synapseStatementCount: synapseResult.summary.statementCount,
+        metadataStatementType: metadataResult.statements[0].statementType,
       });
     } catch (error) {
       body.dataset.status = 'failed';

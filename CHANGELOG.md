@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added synthetic regressions for MSSQL `CREATE OR ALTER VIEW`, multiple Synapse `OPENROWSET` sources, `DELTA` format, and CSV `ROWSET_OPTIONS`.
+- Added narrow Synapse CETAS parsing for `LOCATION`, `DATA_SOURCE`, and `FILE_FORMAT` followed by one `SELECT`; analysis emits an explicit unsupported-lineage warning without creating table or file-write lineage.
+- Confirmed and regression-tested Synapse `OPENROWSET` option ordering: `DATA_SOURCE` precedes `FORMAT`; the reversed order remains rejected.
+
+## [0.9.5] - 2026-09-27
+
+### Fixed
+
+- Hardened MSSQL `GO` batch splitting for comments, malformed repeat suffixes, empty batches, bounded repeats, and original-source byte spans (#16).
+- Preserved complete MSSQL procedural blocks during best-effort recovery without masking malformed input (#17).
+- Added MSSQL procedure-header parsing for unparenthesized parameters and common modifiers (#18).
+- Added explicit metadata-only parsing for supported Synapse external file formats without inventing table lineage (#19).
+- Added bounded parsing support for common Synapse `OPENROWSET(BULK ...)` forms, declared columns, and explicit unsupported-lineage warnings without changing original SQL byte offsets (#20).
+
+## [0.9.4] - 2026-09-27
+
+### Added
+
+- Added strict external per-file dialect, input, encoding, marker, artifact, and batch-context classification for the private corpus harness (#15).
+- Kept preprocessing fail-closed until an authorized corpus inventory justifies a transformation with tested source-offset mapping.
+
+## [0.9.3] - 2026-09-27
+
+### Added
+
+- Added a bounded, pinned, parse-only private corpus harness for measuring parser coverage (#14).
+
 ## [0.9.2] - 2026-09-23
 
 ### Changed

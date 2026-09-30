@@ -16,7 +16,7 @@ use super::functions;
 use super::helpers::check_expr_types;
 use super::Analyzer;
 use crate::generated;
-use crate::types::{AggregationInfo, FilterClauseType};
+use crate::types::{issue_codes, AggregationInfo, FilterClauseType, Issue};
 use crate::Dialect;
 use sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr};
 use std::collections::HashSet;
@@ -79,6 +79,34 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
         let column_refs = self.extract_column_refs_with_warning(expr);
         for col_ref in column_refs {
             if let Some(table) = col_ref.table.as_deref() {
+                if let Some(columns) = self.ctx.external_rowset_columns(table) {
+                    if !columns.is_empty()
+                        && !columns.iter().any(|column| {
+                            self.analyzer.normalize_identifier(&column.name)
+                                == self.analyzer.normalize_identifier(&col_ref.column)
+                        })
+                    {
+                        let available_columns = columns
+                            .iter()
+                            .map(|column| column.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let mut issue = Issue::warning(
+                            issue_codes::UNKNOWN_COLUMN,
+                            format!(
+                                "Column '{}' not found in declared columns for external OPENROWSET alias '{}'. Available columns: {}",
+                                col_ref.column, table, available_columns
+                            ),
+                        )
+                        .with_statement(self.ctx.statement_index);
+                        if let Some(span) = self.analyzer.find_span(&col_ref.column) {
+                            issue = issue.with_span(span);
+                        }
+                        self.analyzer.issues.push(issue);
+                    }
+                    continue;
+                }
+
                 if let Some(canonical) = self.analyzer.resolve_table_alias(self.ctx, Some(table)) {
                     self.analyzer
                         .validate_column(self.ctx, &canonical, &col_ref.column);
