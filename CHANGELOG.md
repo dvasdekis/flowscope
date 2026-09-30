@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added synthetic regressions for MSSQL `CREATE OR ALTER VIEW`, multiple Synapse `OPENROWSET` sources, `DELTA` format, and CSV `ROWSET_OPTIONS`.
-- Added narrow Synapse CETAS parsing for `LOCATION`, `DATA_SOURCE`, and `FILE_FORMAT` followed by one `SELECT`; analysis emits an explicit unsupported-lineage warning without creating table or file-write lineage.
+- Added narrow Synapse CETAS parsing for optional name-only output-column lists, `LOCATION`, `DATA_SOURCE`, and `FILE_FORMAT` followed by one `SELECT`; typed column definitions remain unsupported, and analysis emits an explicit unsupported-lineage warning without creating table or file-write lineage.
 - Confirmed and regression-tested Synapse `OPENROWSET` option ordering: `DATA_SOURCE` precedes `FORMAT`; the reversed order remains rejected.
 
 ## [0.9.5] - 2026-09-27

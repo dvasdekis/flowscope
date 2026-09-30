@@ -2965,6 +2965,104 @@ mod tests {
     }
 
     #[test]
+    fn synapse_cetas_optional_output_columns_use_parse_only_validation() {
+        let sql = concat!(
+            "/* café */ CREATE EXTERNAL TABLE [analytics].[daily_rollup] ",
+            "/* output names */ ([SELECT], [output label], source_id) /* options */ ",
+            "WITH (LOCATION = 'output/daily/', DATA_SOURCE = lake_source, ",
+            "FILE_FORMAT = parquet_format) AS SELECT 1"
+        );
+        assert!(matches!(
+            parse_input_statement_with_dialect_output(sql, Dialect::Mssql),
+            Ok(InputParseOutput::ExternalMetadata(
+                ExternalMetadataStatement::Cetas(_),
+                false
+            ))
+        ));
+
+        let parse_only = crate::analyzer::parse_only_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse-only CETAS with optional output names");
+        assert_eq!(parse_only.statement_count, 1);
+        assert!(!parse_only.parser_fallback_used);
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(analysis.statements.len(), 1);
+        assert!(analysis.nodes.is_empty());
+        assert!(analysis.edges.is_empty());
+        assert!(analysis
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::UNSUPPORTED_SYNTAX));
+
+        let generic = parse_input_statement_with_dialect_output(sql, Dialect::Generic);
+        assert!(
+            !matches!(generic, Ok(InputParseOutput::ExternalMetadata(_, _))),
+            "the Synapse CETAS adapter must remain MSSQL-only"
+        );
+
+        let malformed_columns = concat!(
+            "/* café */ CREATE EXTERNAL TABLE target (id, ) WITH ",
+            "(LOCATION = 'out/', DATA_SOURCE = source, FILE_FORMAT = format) AS SELECT 1"
+        );
+        let column_error =
+            parse_input_statement_with_dialect_output(malformed_columns, Dialect::Mssql)
+                .err()
+                .expect("a trailing output-column comma must be rejected")
+                .into_parse_error();
+        let column_error_position = column_error.position.expect("column-list source position");
+        assert_eq!(column_error.dialect, Some(Dialect::Mssql));
+        let column_error_offset = crate::analyzer::helpers::line_col_to_offset(
+            malformed_columns,
+            column_error_position.line,
+            column_error_position.column,
+        )
+        .expect("column-list error source offset");
+        assert_eq!(
+            column_error_offset,
+            malformed_columns
+                .find("id, )")
+                .expect("malformed column list")
+                + 4,
+            "the error must point at the trailing list delimiter in the original SQL"
+        );
+
+        let query_fragment = "SELECT 'café' AS label FROM )";
+        let malformed_query = format!(
+            "/* café */ CREATE EXTERNAL TABLE target ([label], [source id]) \
+             WITH (LOCATION = 'out/', DATA_SOURCE = source, FILE_FORMAT = format) AS \
+             {query_fragment}"
+        );
+        let query_error =
+            parse_input_statement_with_dialect_output(&malformed_query, Dialect::Mssql)
+                .err()
+                .expect("malformed SELECT after optional output names must fail")
+                .into_parse_error();
+        let query_error_position = query_error.position.expect("query source position");
+        let fragment_error = parse_input_sql_with_dialect_output(query_fragment, Dialect::Mssql)
+            .err()
+            .expect("the SELECT fragment is malformed");
+        let fragment_position = fragment_error.position.expect("fragment source position");
+        let fragment_offset = crate::analyzer::helpers::line_col_to_offset(
+            query_fragment,
+            fragment_position.line,
+            fragment_position.column,
+        )
+        .expect("fragment error offset");
+        let expected_query_error_offset = malformed_query
+            .find(query_fragment)
+            .expect("query source range")
+            + fragment_offset;
+        assert_eq!(
+            offset_to_position(&malformed_query, expected_query_error_offset),
+            Some(query_error_position),
+            "query error coordinates must map through the optional output-column prefix"
+        );
+    }
+
+    #[test]
     fn analysis_source_size_limit_uses_utf8_bytes_and_is_inclusive() {
         let mut request = base_request();
         request.sql = "é".repeat(5);

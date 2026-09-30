@@ -191,6 +191,19 @@ impl<'a> ExternalMetadataParser<'a> {
         self.object_name = "table";
         let _table_name = self.parse_object_name(3)?;
 
+        if self
+            .peek()
+            .is_some_and(|token| matches!(&token.token, Token::LParen))
+        {
+            let column_list_start = self.position;
+            if let Err(error) = self.parse_cetas_output_columns() {
+                if self.has_cetas_clause_after_column_list(column_list_start) {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
+        }
+
         if !self.consume_keyword("WITH") {
             return Ok(None);
         }
@@ -249,6 +262,87 @@ impl<'a> ExternalMetadataParser<'a> {
         Ok(Some(ExternalMetadataStatement::Cetas(CetasDefinition {
             query_range: query_start_offset..self.source_sql.len(),
         })))
+    }
+
+    fn parse_cetas_output_columns(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect_token(
+            |token| matches!(token, Token::LParen),
+            "opening parenthesis before CETAS output column names",
+        )?;
+
+        if self
+            .peek()
+            .is_some_and(|token| matches!(&token.token, Token::RParen))
+        {
+            return Err(self.error(
+                "CETAS output column list must contain at least one column name",
+                ParseErrorKind::SyntaxError,
+            ));
+        }
+
+        let mut columns = vec![self.parse_identifier()?];
+        while self.consume_token(|token| matches!(token, Token::Comma)) {
+            if self
+                .peek()
+                .is_some_and(|token| matches!(&token.token, Token::RParen))
+            {
+                return Err(self.error(
+                    "CETAS output column list cannot end with a comma",
+                    ParseErrorKind::SyntaxError,
+                ));
+            }
+            columns.push(self.parse_identifier()?);
+        }
+
+        self.expect_token(
+            |token| matches!(token, Token::RParen),
+            "closing parenthesis after CETAS output column names",
+        )?;
+        Ok(columns)
+    }
+
+    fn has_cetas_clause_after_column_list(&self, column_list_start: usize) -> bool {
+        let Some(with_position) = self.after_matching_parenthesis(column_list_start) else {
+            return false;
+        };
+        if !self
+            .tokens
+            .get(with_position)
+            .is_some_and(|token| is_keyword(&token.token, "WITH"))
+        {
+            return false;
+        }
+
+        let Some(options_start) = with_position.checked_add(1) else {
+            return false;
+        };
+        let Some(as_position) = self.after_matching_parenthesis(options_start) else {
+            return false;
+        };
+        self.tokens
+            .get(as_position)
+            .is_some_and(|token| is_keyword(&token.token, "AS"))
+    }
+
+    fn after_matching_parenthesis(&self, open_position: usize) -> Option<usize> {
+        if !matches!(&self.tokens.get(open_position)?.token, Token::LParen) {
+            return None;
+        }
+
+        let mut depth = 0usize;
+        for (position, token) in self.tokens.iter().enumerate().skip(open_position) {
+            match &token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return position.checked_add(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn parse_object_name(&mut self, max_parts: usize) -> Result<Vec<String>, ParseError> {
@@ -837,6 +931,53 @@ mod tests {
         assert_eq!(warning.severity, crate::types::Severity::Warning);
         assert_eq!(warning.code, issue_codes::UNSUPPORTED_SYNTAX);
         assert!(warning.message.contains("file-write lineage"));
+    }
+
+    #[test]
+    fn parses_cetas_name_only_output_columns_with_comments_and_quoted_names() {
+        let sql = concat!(
+            "CREATE EXTERNAL TABLE [analytics].[daily_rollup] /* target */ ",
+            "([SELECT] /* between names */, [output label], source_id) /* options */ ",
+            "WITH (LOCATION = 'output/daily/', DATA_SOURCE = lake_source, ",
+            "FILE_FORMAT = parquet_format) AS SELECT 1"
+        );
+
+        let metadata = parse_format(sql)
+            .expect("valid CETAS output-column list")
+            .expect("CETAS metadata");
+        let ExternalMetadataStatement::Cetas(cetas) = metadata else {
+            panic!("expected CETAS metadata");
+        };
+        assert_eq!(
+            sql[cetas.query_range].trim_start(),
+            "SELECT 1",
+            "the query source range must start after the optional output-column list"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_cetas_output_column_lists_at_the_original_token() {
+        for columns in [
+            "()",
+            "(id,)",
+            "(, id)",
+            "('id')",
+            "(1)",
+            "(id.name)",
+            "(id INT)",
+        ] {
+            let sql = format!(
+                "CREATE EXTERNAL TABLE target {columns} WITH \
+                 (LOCATION = 'out/', DATA_SOURCE = source, FILE_FORMAT = format) AS SELECT 1"
+            );
+            let error = parse_format(&sql)
+                .expect_err("invalid CETAS output-column syntax must be rejected");
+            assert_eq!(error.dialect, Some(Dialect::Mssql), "{columns}");
+            assert!(
+                error.position.is_some(),
+                "malformed output columns should retain a source position: {columns}"
+            );
+        }
     }
 
     #[test]

@@ -159,7 +159,7 @@ fn analyze_sql_json_keeps_malformed_synapse_procedure_parameters_as_parse_errors
 
 #[test]
 fn analyze_sql_json_accepts_cetas_without_inventing_external_lineage() {
-    let sql = "CREATE EXTERNAL TABLE dbo.export_rows WITH (LOCATION = 'export/', DATA_SOURCE = storage_source, FILE_FORMAT = parquet_format) AS SELECT id FROM dbo.source_rows";
+    let sql = "CREATE EXTERNAL TABLE dbo.export_rows ([export_id]) WITH (LOCATION = 'export/', DATA_SOURCE = storage_source, FILE_FORMAT = parquet_format) AS SELECT id FROM dbo.source_rows";
     let result = analyze_mssql(sql);
 
     assert_eq!(result["statements"].as_array().unwrap().len(), 1);
@@ -179,6 +179,15 @@ fn analyze_sql_json_accepts_cetas_without_inventing_external_lineage() {
 fn analyze_sql_json_rejects_cetas_with_a_malformed_select() {
     let result = analyze_mssql(
         "CREATE EXTERNAL TABLE dbo.export_rows WITH (LOCATION = 'export/', DATA_SOURCE = storage_source, FILE_FORMAT = parquet_format) AS SELECT FROM",
+    );
+
+    assert!(has_issue(&result, "PARSE_ERROR"));
+}
+
+#[test]
+fn analyze_sql_json_rejects_typed_cetas_output_columns() {
+    let result = analyze_mssql(
+        "CREATE EXTERNAL TABLE dbo.export_rows (export_id INT) WITH (LOCATION = 'export/', DATA_SOURCE = storage_source, FILE_FORMAT = parquet_format) AS SELECT id FROM dbo.source_rows",
     );
 
     assert!(has_issue(&result, "PARSE_ERROR"));
