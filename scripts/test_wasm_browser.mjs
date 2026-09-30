@@ -27,6 +27,18 @@ const harness = `<!doctype html>
     const hasWarning = (result, code) => result.issues.some(
       (issue) => issue.code === code && issue.severity === 'warning'
     );
+    const isMetadata = (result, statementType) =>
+      result.statements.length === 1 &&
+      result.statements[0].statementType === statementType &&
+      result.nodes.length === 0 &&
+      result.edges.length === 0 &&
+      hasWarning(result, 'UNSUPPORTED_SYNTAX') &&
+      !hasIssue(result, 'PARSE_ERROR');
+    const isOpenrowset = (result) =>
+      result.statements.length === 1 &&
+      !hasIssue(result, 'PARSE_ERROR') &&
+      hasWarning(result, 'UNSUPPORTED_SYNTAX') &&
+      result.nodes.every((node) => node.type !== 'table');
     try {
       await init('/flowscope_wasm_bg.wasm');
       const request = {
@@ -72,6 +84,57 @@ const harness = `<!doctype html>
       const malformedMetadataResult = analyzeMssql(
         "CREATE EXTERNAL FILE FORMAT synthetic_parquet WITH (FORMAT_TYPE = PARQUET, FORMAT_OPTIONS (FIELD_TERMINATOR = ','))"
       );
+      const bareMetadataSql =
+        "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'synthetic_bare_format') CREATE EXTERNAL FILE FORMAT synthetic_bare_format WITH (FORMAT_TYPE = PARQUET)";
+      const bareMetadataResult = analyzeMssql(bareMetadataSql);
+      const malformedBareMetadataResult = analyzeMssql(
+        "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'synthetic_bare_format') CREATE EXTERNAL FILE FORMAT synthetic_bare_format WITH (FORMAT_TYPE =)"
+      );
+      const dataSourceBeforeFormatResult = analyzeMssql(
+        "SELECT src.id FROM OPENROWSET(BULK 'data.parquet', DATA_SOURCE = 'synthetic_lake', FORMAT = 'PARQUET') AS src"
+      );
+      const formatBeforeDataSourceResult = analyzeMssql(
+        "SELECT src.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 'synthetic_lake') AS src"
+      );
+      const malformedDataSourceBeforeFormatResult = analyzeMssql(
+        "SELECT src.id FROM OPENROWSET(BULK 'data.parquet', DATA_SOURCE = 1, FORMAT = 'PARQUET') AS src"
+      );
+      const malformedFormatBeforeDataSourceResult = analyzeMssql(
+        "SELECT src.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 1) AS src"
+      );
+      const trimPredicateResult = analyzeMssql("SELECT 1 WHERE TRIM = 'synthetic'");
+      const malformedTrimPredicateResult = analyzeMssql('SELECT 1 WHERE TRIM =');
+      const bulkFileListResult = analyzeMssql(
+        "SELECT src.id FROM OPENROWSET(BULK ('data/a.parquet', 'data/b.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS src"
+      );
+      const malformedBulkFileListResult = analyzeMssql(
+        "SELECT src.id FROM OPENROWSET(BULK ('data/a.parquet',), FORMAT = 'PARQUET') WITH (id INT) AS src"
+      );
+      const inlineTvfSql =
+        'CREATE FUNCTION dbo.synthetic_rows() RETURNS TABLE AS RETURN WITH synthetic_cte AS (SELECT 1 AS synthetic_value) SELECT synthetic_value FROM synthetic_cte';
+      const inlineTvfResult = analyzeMssql(inlineTvfSql);
+      const malformedInlineTvfResult = analyzeMssql(
+        'CREATE FUNCTION dbo.synthetic_rows() RETURNS TABLE AS RETURN WITH synthetic_cte AS (SELECT 1) SELECT FROM synthetic_cte'
+      );
+      const cetasNameListResult = analyzeMssql(
+        "CREATE EXTERNAL TABLE dbo.synthetic_export ([export_id]) WITH (LOCATION = 'synthetic-output/', DATA_SOURCE = synthetic_storage, FILE_FORMAT = synthetic_format) AS SELECT id FROM dbo.synthetic_source"
+      );
+      const malformedCetasNameListResult = analyzeMssql(
+        "CREATE EXTERNAL TABLE dbo.synthetic_export (export_id,) WITH (LOCATION = 'synthetic-output/', DATA_SOURCE = synthetic_storage, FILE_FORMAT = synthetic_format) AS SELECT id FROM dbo.synthetic_source"
+      );
+      const malformedTypedCetasNameListResult = analyzeMssql(
+        "CREATE EXTERNAL TABLE dbo.synthetic_export (export_id INT) WITH (LOCATION = 'synthetic-output/', DATA_SOURCE = synthetic_storage, FILE_FORMAT = synthetic_format) AS SELECT id FROM dbo.synthetic_source"
+      );
+      const malformedSynapseResults = [
+        malformedBareMetadataResult,
+        malformedDataSourceBeforeFormatResult,
+        malformedFormatBeforeDataSourceResult,
+        malformedTrimPredicateResult,
+        malformedBulkFileListResult,
+        malformedInlineTvfResult,
+        malformedCetasNameListResult,
+        malformedTypedCetasNameListResult,
+      ];
 
       if (result.statements.length !== 1 || result.summary.statementCount !== 1) {
         throw new Error('Expected one analyzed statement');
@@ -132,6 +195,43 @@ const harness = `<!doctype html>
       if (!hasIssue(malformedMetadataResult, 'PARSE_ERROR')) {
         throw new Error('Unsupported external file format options were accepted');
       }
+      if (!isMetadata(bareMetadataResult, 'CREATE_EXTERNAL_FILE_FORMAT')) {
+        throw new Error('Bare IF external metadata analysis failed: ' + JSON.stringify(bareMetadataResult));
+      }
+      if (!isOpenrowset(dataSourceBeforeFormatResult) ||
+          !isOpenrowset(formatBeforeDataSourceResult)) {
+        throw new Error(
+          'Synapse OPENROWSET option ordering failed: ' +
+          JSON.stringify([
+            dataSourceBeforeFormatResult.issues,
+            formatBeforeDataSourceResult.issues,
+          ])
+        );
+      }
+      if (trimPredicateResult.statements.length !== 1 ||
+          hasIssue(trimPredicateResult, 'PARSE_ERROR')) {
+        throw new Error(
+          'MSSQL nonreserved TRIM predicate failed: ' +
+          JSON.stringify(trimPredicateResult.issues)
+        );
+      }
+      if (!isOpenrowset(bulkFileListResult)) {
+        throw new Error('Synapse BULK file list analysis failed: ' + JSON.stringify(bulkFileListResult.issues));
+      }
+      if (inlineTvfResult.statements.length !== 1 ||
+          inlineTvfResult.statements[0].span.end !== inlineTvfSql.length ||
+          hasIssue(inlineTvfResult, 'PARSE_ERROR')) {
+        throw new Error('Inline TVF CTE without a final semicolon failed: ' + JSON.stringify(inlineTvfResult));
+      }
+      if (!isMetadata(cetasNameListResult, 'CREATE_EXTERNAL_TABLE_AS_SELECT')) {
+        throw new Error('CETAS output-name list analysis failed: ' + JSON.stringify(cetasNameListResult));
+      }
+      if (malformedSynapseResults.some((synapseResult) => !hasIssue(synapseResult, 'PARSE_ERROR'))) {
+        throw new Error(
+          'A malformed Synapse SQL counterpart was accepted: ' +
+          JSON.stringify(malformedSynapseResults.map((synapseResult) => synapseResult.issues))
+        );
+      }
 
       body.dataset.status = 'passed';
       body.textContent = JSON.stringify({
@@ -142,6 +242,12 @@ const harness = `<!doctype html>
         moduleStatementType: moduleResult.statements[0].statementType,
         synapseStatementCount: synapseResult.summary.statementCount,
         metadataStatementType: metadataResult.statements[0].statementType,
+        bareIfMetadataType: bareMetadataResult.statements[0].statementType,
+        openrowsetOptionOrders: 2,
+        bulkFileList: true,
+        inlineTvfCteWithoutFinalSemicolon: true,
+        cetasOutputNameList: true,
+        malformedSynapseCases: malformedSynapseResults.length,
       });
     } catch (error) {
       body.dataset.status = 'failed';

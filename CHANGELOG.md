@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Accepted MSSQL inline table-valued function `RETURN WITH ... SELECT ...` bodies without outer parentheses, including EOF without a final semicolon, while preserving source spans and rejecting malformed returns.
+- Used the T-SQL reserved-keyword policy for MSSQL identifier fallback, allowing nonreserved special-expression spellings such as `TRIM` as column references without changing other dialects or accepting malformed expressions.
 - Added MSSQL-only parsing support for documented Synapse `OPENROWSET(BULK ('path1', 'path2'), ...)` file lists, with malformed lists rejected and original source offsets preserved.
 - Accepted declared-column `COLLATE` on Synapse `OPENROWSET` while preserving the parsed data type and source offsets.
 - Split supported semicolon-optional MSSQL statements—including `EXEC`/`DROP VIEW`, `BEGIN`/`SET`, and `WHILE`/`SET` batches—at validated top-level newline boundaries without changing other dialects or recovering malformed fragments as valid statements.
