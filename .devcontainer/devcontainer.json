@@ -1,0 +1,66 @@
+{
+  "name": "FlowScope",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "privileged": true,
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest"
+    }
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "CARGO_TERM_COLOR": "always",
+    "RUST_BACKTRACE": "1"
+  },
+  "mounts": [
+    "source=flowscope-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=flowscope-cargo-registry,target=/home/vscode/.cargo/registry,type=volume",
+    "source=flowscope-cargo-git,target=/home/vscode/.cargo/git,type=volume",
+    "source=flowscope-yarn-cache,target=/home/vscode/.cache/yarn,type=volume"
+  ],
+  "forwardPorts": [5173, 8080],
+  "portsAttributes": {
+    "5173": {
+      "label": "FlowScope Vite app",
+      "onAutoForward": "openBrowser"
+    },
+    "8080": {
+      "label": "FlowScope CLI server",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "bradlc.vscode-tailwindcss",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        },
+        "[typescript]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        },
+        "[typescriptreact]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        },
+        "files.watcherExclude": {
+          "**/target/**": true,
+          "**/node_modules/**": true,
+          "**/.git/objects/**": true
+        }
+      }
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "shutdownAction": "stopContainer"
+}
