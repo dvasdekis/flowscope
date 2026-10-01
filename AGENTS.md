@@ -162,6 +162,7 @@ Use a single repo tag for each release (`vX.Y.Z`) and align Rust workspace + npm
 
 1. Update versions:
    - `Cargo.toml` workspace version + workspace dependencies
+   - `vendor/sqlparser/Cargo.toml` (`flowscope-sqlparser`, based on upstream 0.61.0)
    - `packages/core/package.json`, `packages/react/package.json`, `packages/core/wasm/package.json`
    - Update peer dependency on `@pondpilot/flowscope-core` in `packages/react`
 2. Update `CHANGELOG.md`:
@@ -170,9 +171,11 @@ Use a single repo tag for each release (`vX.Y.Z`) and align Rust workspace + npm
 3. Validate:
    - `just fmt-rust`
    - `just test-core`
+   - `cargo package -p flowscope-sqlparser -p flowscope-core --locked` (stages the unpublished parser dependency without publishing)
    - `yarn workspace @pondpilot/flowscope-react build`
    - `yarn workspace @pondpilot/flowscope-core build`
 4. Publish crates (order matters):
+   - `cargo publish -p flowscope-sqlparser`
    - `cargo publish -p flowscope-core`
    - `cargo publish -p flowscope-export`
    - `cargo publish -p flowscope-cli`

@@ -3,6 +3,7 @@ use crate::types::Dialect;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, TokenWithSpan, Whitespace};
 
 mod mssql_dialect;
 mod mssql_module;
@@ -115,6 +116,92 @@ pub fn parse_sql_with_dialect_output(
             Err(mssql_adapter_error.unwrap_or(primary_err).into())
         }
     }
+}
+
+/// Parse an already-tokenized dialect-compatible SQL stream.
+///
+/// This is used by narrow adapters that need to preserve the source buffer and
+/// token locations while changing parser-only punctuation. It also carries the
+/// generic trailing-comma fallback into token-only paths; dialect-specific
+/// string sanitizers remain in the source-text parser above.
+pub(crate) fn parse_sql_with_dialect_tokens_output(
+    dialect: Dialect,
+    tokens: Vec<TokenWithSpan>,
+) -> Result<ParseSqlOutput, ParseError> {
+    let sqlparser_dialect: Box<dyn sqlparser::dialect::Dialect> =
+        if matches!(dialect, Dialect::Mssql) {
+            Box::new(mssql_dialect::MssqlParserDialect::default())
+        } else {
+            dialect.to_sqlparser_dialect()
+        };
+    let (tokens, _) = sanitize_trailing_comma_before_from_tokens(tokens);
+
+    match Parser::new(sqlparser_dialect.as_ref())
+        .with_tokens_with_locations(tokens.clone())
+        .parse_statements()
+    {
+        Ok(statements) => Ok(ParseSqlOutput {
+            statements,
+            parser_fallback_used: true,
+        }),
+        Err(primary_error) => {
+            let mut mssql_adapter_error = None;
+            if matches!(dialect, Dialect::Mssql) {
+                if let Some(adapted_parse) =
+                    mssql_module::parse_compatible_module_tokens(tokens, sqlparser_dialect.as_ref())
+                {
+                    match adapted_parse {
+                        Ok(statements) => {
+                            return Ok(ParseSqlOutput {
+                                statements,
+                                parser_fallback_used: true,
+                            });
+                        }
+                        Err(error) => mssql_adapter_error = Some(error),
+                    }
+                }
+            }
+            Err(mssql_adapter_error.unwrap_or(primary_error).into())
+        }
+    }
+}
+
+fn sanitize_trailing_comma_before_from_tokens(
+    tokens: Vec<TokenWithSpan>,
+) -> (Vec<TokenWithSpan>, bool) {
+    let mut remove = vec![false; tokens.len()];
+    for (index, token) in tokens.iter().enumerate() {
+        if !matches!(token.token, Token::Comma) {
+            continue;
+        }
+        let mut next = index + 1;
+        while tokens.get(next).is_some_and(|token| {
+            matches!(
+                token.token,
+                Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab)
+            )
+        }) {
+            next += 1;
+        }
+        if tokens.get(next).is_some_and(|token| {
+            matches!(
+                &token.token,
+                Token::Word(word)
+                    if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("FROM")
+            )
+        }) {
+            remove[index] = true;
+        }
+    }
+    let changed = remove.iter().any(|remove| *remove);
+    (
+        tokens
+            .into_iter()
+            .zip(remove)
+            .filter_map(|(token, remove)| (!remove).then_some(token))
+            .collect(),
+        changed,
+    )
 }
 
 fn looks_like_postgres_syntax(sql: &str) -> bool {

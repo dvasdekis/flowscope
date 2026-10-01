@@ -125,6 +125,33 @@ const harness = `<!doctype html>
       const malformedTypedCetasNameListResult = analyzeMssql(
         "CREATE EXTERNAL TABLE dbo.synthetic_export (export_id INT) WITH (LOCATION = 'synthetic-output/', DATA_SOURCE = synthetic_storage, FILE_FORMAT = synthetic_format) AS SELECT id FROM dbo.synthetic_source"
       );
+      const bulkBoundaryResults = ['', '\\n', '\\r\\n', '/* list boundary */'].map(
+        (separator) => analyzeMssql(
+          "SELECT src.id FROM OPENROWSET(BULK" + separator +
+          "('demo/a.parquet', 'demo/b.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS src"
+        )
+      );
+      const procedureRowsetSql =
+        "CREATE OR ALTER PROCEDURE dbo.synthetic_rows AS BEGIN SELECT src.id FROM OPENROWSET(BULK\\n('demo/a.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS src; END";
+      const procedureRowsetResult = analyzeMssql(procedureRowsetSql);
+      const guardedTableResults = [
+        "IF NOT EXISTS (SELECT 1) CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+        "IF NOT EXISTS (SELECT 1) BEGIN CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format); END",
+        "IF OBJECT_ID(N'dbo.synthetic_rows', N'U') IS NULL CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (DATA_SOURCE = synthetic_store, LOCATION = 'demo/', FILE_FORMAT = synthetic_format)",
+        "IF OBJECT_ID('dbo.synthetic_rows') IS NULL BEGIN CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format); END",
+      ].map(analyzeMssql);
+      const mssqlExpressionResults = [
+        "CREATE OR ALTER VIEW dbo.synthetic_view AS SELECT t.demo_value FROM dbo.synthetic_table AS t WHERE t.demo_value COLLATE Latin1_General_100_CI_AS = N'demo'",
+        "CREATE OR ALTER VIEW dbo.synthetic_view AS SELECT TRY_PARSE(N'2024-01-02' AS DATETIME USING N'en-US') AS parsed_value",
+        "SELECT INTERVAL FROM dbo.synthetic_table",
+        "SELECT INTERVAL + 1 AS interval_value, INTERVAL implicit_alias FROM dbo.synthetic_table WHERE INTERVAL IS NULL",
+        "SELECT TRY_PARSE(INTERVAL AS DATE USING DATE) FROM dbo.synthetic_table",
+        "SELECT CAST(INTERVAL AS INT), CONVERT(INT, INTERVAL), TRY_CAST(INTERVAL AS INT), TRY_CONVERT(INT, INTERVAL) FROM dbo.synthetic_table",
+      ].map(analyzeMssql);
+      const optionalTerminatorResults = [
+        "CREATE OR ALTER PROCEDURE dbo.synthetic_proc AS BEGIN DECLARE @value INT SELECT @value = 1 END",
+        "BEGIN DECLARE @value INT SELECT @value = 1 END",
+      ].map(analyzeMssql);
       const malformedSynapseResults = [
         malformedBareMetadataResult,
         malformedDataSourceBeforeFormatResult,
@@ -134,6 +161,22 @@ const harness = `<!doctype html>
         malformedInlineTvfResult,
         malformedCetasNameListResult,
         malformedTypedCetasNameListResult,
+        ...[
+          "SELECT * FROM OPENROWSET(BULK\\n('demo/a.parquet',), FORMAT = 'PARQUET') AS src",
+          "SELECT * FROM OPENROWSET(BULK(), FORMAT = 'PARQUET') AS src",
+          "CREATE PROCEDURE dbo.synthetic_rows AS BEGIN SELECT * FROM OPENROWSET(BULK('demo/a.parquet'), FORMAT = 'PARQUET') WITH (id) AS src; END",
+          "IF NOT EXISTS (SELECT FROM) CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+          "IF NOT EXISTS (SELECT 1) BEGIN CREATE EXTERNAL TABLE dbo.synthetic_rows (id) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format); END",
+          "IF NOT EXISTS (SELECT 1) CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format) ELSE SELECT 1",
+          "SELECT t.demo_value COLLATE FROM dbo.synthetic_table AS t",
+          "SELECT TRY_PARSE(N'2024-01-02' AS)",
+          "SELECT INTERVAL FROM dbo.",
+          "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN DECLARE @value SELECT FROM END",
+          "IF OBJECT_ID() IS NULL CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+          "IF OBJECT_ID('dbo.synthetic_rows') CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+          "CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (DATA_SOURCE = synthetic_store, DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+          "CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (DATA_SOURCE = synthetic_store, LOCATION = '', FILE_FORMAT = synthetic_format)",
+        ].map(analyzeMssql),
       ];
 
       if (result.statements.length !== 1 || result.summary.statementCount !== 1) {
@@ -226,6 +269,23 @@ const harness = `<!doctype html>
       if (!isMetadata(cetasNameListResult, 'CREATE_EXTERNAL_TABLE_AS_SELECT')) {
         throw new Error('CETAS output-name list analysis failed: ' + JSON.stringify(cetasNameListResult));
       }
+      if (!bulkBoundaryResults.every(isOpenrowset)) {
+        throw new Error('Synapse BULK lexical boundary analysis failed');
+      }
+      if (procedureRowsetResult.statements.length !== 1 ||
+          procedureRowsetResult.statements[0].statementType !== 'CREATE_PROCEDURE' ||
+          procedureRowsetResult.statements[0].span.end !== procedureRowsetSql.length ||
+          hasIssue(procedureRowsetResult, 'PARSE_ERROR')) {
+        throw new Error('OPENROWSET schema in a procedure body failed');
+      }
+      if (!guardedTableResults.every((table) => isMetadata(table, 'CREATE_EXTERNAL_TABLE'))) {
+        throw new Error('Guarded external-table metadata analysis failed');
+      }
+      if (![...mssqlExpressionResults, ...optionalTerminatorResults].every(
+        (statement) => statement.statements.length === 1 && !hasIssue(statement, 'PARSE_ERROR')
+      )) {
+        throw new Error('MSSQL expression or optional procedural terminator analysis failed');
+      }
       if (malformedSynapseResults.some((synapseResult) => !hasIssue(synapseResult, 'PARSE_ERROR'))) {
         throw new Error(
           'A malformed Synapse SQL counterpart was accepted: ' +
@@ -247,6 +307,11 @@ const harness = `<!doctype html>
         bulkFileList: true,
         inlineTvfCteWithoutFinalSemicolon: true,
         cetasOutputNameList: true,
+        bulkLexicalBoundaries: bulkBoundaryResults.length,
+        procedureRowsetSchema: true,
+        guardedExternalTables: guardedTableResults.length,
+        mssqlExpressions: mssqlExpressionResults.length,
+        optionalProceduralTerminators: optionalTerminatorResults.length,
         malformedSynapseCases: malformedSynapseResults.length,
       });
     } catch (error) {

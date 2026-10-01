@@ -5,6 +5,8 @@ use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Span, Token, TokenWithSpan, Tokenizer, Word};
 use std::ops::Range;
 
+const MAX_OPTIONAL_MODULE_TERMINATORS: usize = 128;
+
 /// Parse the narrow MSSQL module variants supported by this adapter.
 ///
 /// The source string is never rewritten; adapted and synthetic tokens retain
@@ -13,15 +15,451 @@ pub(super) fn parse_compatible_module(
     sql: &str,
     dialect: &dyn Dialect,
 ) -> Option<Result<Vec<Statement>, ParserError>> {
-    let mut tokens = Tokenizer::new(dialect, sql).tokenize_with_location().ok()?;
+    let tokens = Tokenizer::new(dialect, sql).tokenize_with_location().ok()?;
+    parse_compatible_module_tokens(tokens, dialect)
+}
+
+pub(super) fn parse_compatible_module_tokens(
+    mut tokens: Vec<TokenWithSpan>,
+    dialect: &dyn Dialect,
+) -> Option<Result<Vec<Statement>, ParserError>> {
+    let standalone_block = is_standalone_mssql_begin_end_block(&tokens);
+    if standalone_block {
+        tokens = wrap_standalone_mssql_block(tokens, dialect)?;
+    }
+
+    let has_module_header = has_mssql_module_header(&tokens);
     let procedure_adapted = adapt_procedure_headers(&mut tokens);
     let function_adapted = adapt_inline_table_function_return(&mut tokens);
-    if !procedure_adapted && !function_adapted {
+    if !procedure_adapted && !function_adapted && !has_module_header {
         return None;
     }
 
-    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
-    Some(parser.parse_statements())
+    let parsed = Parser::new(dialect)
+        .with_tokens_with_locations(tokens.clone())
+        .parse_statements();
+    match parsed {
+        Ok(statements) => Some(unwrap_standalone_mssql_block(statements, standalone_block)),
+        Err(error) if has_module_header => {
+            if let Some(recovered) =
+                recover_optional_module_terminators(tokens, dialect, error.clone())
+            {
+                Some(recovered.and_then(|statements| {
+                    unwrap_standalone_mssql_block(statements, standalone_block)
+                }))
+            } else if procedure_adapted || function_adapted {
+                Some(Err(error))
+            } else {
+                None
+            }
+        }
+        Err(error) if procedure_adapted || function_adapted => Some(Err(error)),
+        Err(_) => None,
+    }
+}
+
+fn has_mssql_module_header(tokens: &[TokenWithSpan]) -> bool {
+    let significant = significant_token_indices(tokens);
+    (0..significant.len()).any(|position| {
+        if !word_is_at(tokens, &significant, position, "CREATE") {
+            return false;
+        }
+        let mut module_position = position + 1;
+        if word_is_at(tokens, &significant, module_position, "OR")
+            && word_is_at(tokens, &significant, module_position + 1, "ALTER")
+        {
+            module_position += 2;
+        }
+        ["PROC", "PROCEDURE", "FUNCTION", "TRIGGER"]
+            .iter()
+            .any(|module| word_is_at(tokens, &significant, module_position, module))
+    })
+}
+
+fn is_standalone_mssql_begin_end_block(tokens: &[TokenWithSpan]) -> bool {
+    let significant = significant_token_indices(tokens);
+    let Some(begin_index) = significant
+        .iter()
+        .copied()
+        .find(|index| !matches!(tokens[*index].token, Token::SemiColon | Token::EOF))
+    else {
+        return false;
+    };
+    if !word_is(tokens, begin_index, "BEGIN")
+        || mssql_word_follows_any(tokens, begin_index, MSSQL_BEGIN_NON_BLOCK_FOLLOWERS)
+    {
+        return false;
+    }
+
+    let Some(end_index) = matching_standalone_block_end(tokens, begin_index) else {
+        return false;
+    };
+    tokens[end_index + 1..].iter().all(|token| {
+        matches!(
+            token.token,
+            Token::Whitespace(_) | Token::SemiColon | Token::EOF
+        )
+    })
+}
+
+fn matching_standalone_block_end(tokens: &[TokenWithSpan], begin_index: usize) -> Option<usize> {
+    let mut block_depth = 0i32;
+    let mut case_depth = 0i32;
+    for (index, token) in tokens.iter().enumerate().skip(begin_index) {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if word.quote_style.is_some() {
+            continue;
+        }
+        if word.value.eq_ignore_ascii_case("GO") {
+            return None;
+        }
+        if word.value.eq_ignore_ascii_case("CASE") {
+            case_depth += 1;
+        } else if word.value.eq_ignore_ascii_case("END") {
+            if case_depth > 0 {
+                case_depth -= 1;
+            } else if !mssql_word_follows(tokens, index, "CONVERSATION") {
+                block_depth -= 1;
+                if block_depth == 0 {
+                    return Some(index);
+                }
+            }
+        } else if word.value.eq_ignore_ascii_case("BEGIN")
+            && !mssql_word_follows_any(tokens, index, MSSQL_BEGIN_NON_BLOCK_FOLLOWERS)
+        {
+            block_depth += 1;
+        }
+    }
+    None
+}
+
+fn wrap_standalone_mssql_block(
+    mut tokens: Vec<TokenWithSpan>,
+    dialect: &dyn Dialect,
+) -> Option<Vec<TokenWithSpan>> {
+    let begin_index = significant_token_indices(&tokens)
+        .into_iter()
+        .find(|index| !matches!(tokens[*index].token, Token::SemiColon | Token::EOF))?;
+    let insertion_span = point_span(tokens[begin_index].span.start)?;
+    let mut prefix = Tokenizer::new(dialect, "CREATE PROCEDURE __flowscope_block_wrapper AS ")
+        .tokenize_with_location()
+        .ok()?
+        .into_iter()
+        .filter(|token| !matches!(token.token, Token::EOF))
+        .map(|mut token| {
+            token.span = insertion_span;
+            token
+        })
+        .collect::<Vec<_>>();
+    let mut wrapped = tokens.drain(..begin_index).collect::<Vec<_>>();
+    wrapped.append(&mut prefix);
+    wrapped.extend(tokens);
+    Some(wrapped)
+}
+
+fn unwrap_standalone_mssql_block(
+    statements: Vec<Statement>,
+    wrapped: bool,
+) -> Result<Vec<Statement>, ParserError> {
+    if !wrapped {
+        return Ok(statements);
+    }
+
+    let [Statement::CreateProcedure { body, .. }] = statements.as_slice() else {
+        return Err(ParserError::ParserError(
+            "Expected synthetic procedure wrapper for standalone T-SQL block".to_string(),
+        ));
+    };
+    let sqlparser::ast::ConditionalStatements::BeginEnd(block) = body else {
+        return Err(ParserError::ParserError(
+            "Expected BEGIN/END body for standalone T-SQL block".to_string(),
+        ));
+    };
+    // Keep sqlparser's BEGIN/END statement container without exposing the synthetic procedure.
+    Ok(vec![Statement::StartTransaction {
+        modes: Vec::new(),
+        begin: true,
+        transaction: None,
+        modifier: None,
+        statements: block.statements.clone(),
+        exception: None,
+        has_end_keyword: true,
+    }])
+}
+
+fn recover_optional_module_terminators(
+    mut tokens: Vec<TokenWithSpan>,
+    dialect: &dyn Dialect,
+    mut error: ParserError,
+) -> Option<Result<Vec<Statement>, ParserError>> {
+    let mut inserted_any = false;
+    for _ in 0..MAX_OPTIONAL_MODULE_TERMINATORS {
+        let Some(candidate) = parser_reported_missing_terminator(&error, &tokens) else {
+            return inserted_any.then_some(Err(error));
+        };
+        if !is_mssql_procedural_block_position(&tokens, candidate)
+            || !is_optional_statement_start(&tokens[candidate].token)
+        {
+            return inserted_any.then_some(Err(error));
+        }
+        let Some(fragment_start) = complete_statement_start_before(&tokens, candidate, dialect)
+        else {
+            return inserted_any.then_some(Err(error));
+        };
+
+        let insertion_span = point_span(tokens[candidate].span.start)?;
+        tokens.insert(
+            candidate,
+            TokenWithSpan::new(Token::SemiColon, insertion_span),
+        );
+        inserted_any = true;
+        match Parser::new(dialect)
+            .with_tokens_with_locations(tokens.clone())
+            .parse_statements()
+        {
+            Ok(statements) => return Some(Ok(statements)),
+            Err(next_error) => error = next_error,
+        }
+
+        if !is_complete_statement_fragment(
+            &tokens[fragment_start..candidate],
+            tokens[candidate].span.start,
+            dialect,
+        ) {
+            return Some(Err(error));
+        }
+    }
+    Some(Err(error))
+}
+
+fn parser_reported_missing_terminator(
+    error: &ParserError,
+    tokens: &[TokenWithSpan],
+) -> Option<usize> {
+    let ParserError::ParserError(message) = error else {
+        return None;
+    };
+    if !message.starts_with("Expected: end of statement, found: ")
+        && !message.starts_with("Expected: ;, found: ")
+    {
+        return None;
+    }
+
+    let (_, location) = message.rsplit_once(" at Line: ")?;
+    let (line, column) = location.split_once(", Column: ")?;
+    let line = line.parse::<u64>().ok()?;
+    let column = column.parse::<u64>().ok()?;
+    tokens.iter().position(|token| {
+        token.span.start.line == line
+            && token.span.start.column == column
+            && is_optional_statement_start(&token.token)
+    })
+}
+
+fn is_optional_statement_start(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Word(word)
+            if word.quote_style.is_none()
+                && [
+                    "BEGIN",
+                    "DECLARE",
+                    "DELETE",
+                    "END",
+                    "EXEC",
+                    "EXECUTE",
+                    "IF",
+                    "INSERT",
+                    "PRINT",
+                    "RAISERROR",
+                    "RETURN",
+                    "SELECT",
+                    "SET",
+                    "THROW",
+                    "UPDATE",
+                    "WHILE",
+                ]
+                .iter()
+                .any(|keyword| word.value.eq_ignore_ascii_case(keyword))
+    )
+}
+
+fn is_mssql_procedural_block_position(tokens: &[TokenWithSpan], candidate: usize) -> bool {
+    let mut block_depth = 0i32;
+    let mut case_depth = 0i32;
+    for (index, token) in tokens.iter().enumerate().take(candidate) {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if word.quote_style.is_some() {
+            continue;
+        }
+        if word.value.eq_ignore_ascii_case("GO") {
+            block_depth = 0;
+            case_depth = 0;
+            continue;
+        }
+        if word.value.eq_ignore_ascii_case("CASE") {
+            case_depth += 1;
+        } else if word.value.eq_ignore_ascii_case("END") {
+            if case_depth > 0 {
+                case_depth -= 1;
+            } else if !mssql_word_follows(tokens, index, "CONVERSATION") {
+                block_depth -= 1;
+            }
+        } else if word.value.eq_ignore_ascii_case("BEGIN")
+            && !mssql_word_follows_any(tokens, index, MSSQL_BEGIN_NON_BLOCK_FOLLOWERS)
+        {
+            block_depth += 1;
+        }
+    }
+    block_depth > 0 && (!word_is(tokens, candidate, "END") || case_depth == 0)
+}
+
+fn complete_statement_start_before(
+    tokens: &[TokenWithSpan],
+    candidate: usize,
+    dialect: &dyn Dialect,
+) -> Option<usize> {
+    let mut boundaries = Vec::new();
+    for index in 0..candidate {
+        if matches!(tokens[index].token, Token::SemiColon)
+            || (word_is(tokens, index, "BEGIN")
+                && !mssql_word_follows_any(tokens, index, MSSQL_BEGIN_NON_BLOCK_FOLLOWERS))
+            || word_is(tokens, index, "ELSE")
+        {
+            boundaries.push(index + 1);
+        }
+    }
+    boundaries.into_iter().rev().find_map(|start| {
+        if tokens[start..candidate]
+            .iter()
+            .any(|token| word_is_token(&token.token, "GO"))
+        {
+            return None;
+        }
+        let start = next_significant_token_index(tokens, start, candidate)?;
+        is_complete_statement_fragment(
+            &tokens[start..candidate],
+            tokens[candidate].span.start,
+            dialect,
+        )
+        .then_some(start)
+    })
+}
+
+const MSSQL_BEGIN_NON_BLOCK_FOLLOWERS: &[&str] = &[
+    "TRAN",
+    "TRANSACTION",
+    "WORK",
+    "DIALOG",
+    "DISTRIBUTED",
+    "CONVERSATION",
+    "ISOLATION",
+    "READ",
+];
+
+fn next_significant_token_index(
+    tokens: &[TokenWithSpan],
+    mut index: usize,
+    end: usize,
+) -> Option<usize> {
+    while index < end {
+        if !matches!(tokens[index].token, Token::Whitespace(_)) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn mssql_word_follows(tokens: &[TokenWithSpan], index: usize, expected: &str) -> bool {
+    mssql_word_follows_any(tokens, index, &[expected])
+}
+
+fn mssql_word_follows_any(tokens: &[TokenWithSpan], index: usize, expected: &[&str]) -> bool {
+    tokens[index + 1..]
+        .iter()
+        .find_map(|token| match &token.token {
+            Token::Whitespace(_) => None,
+            Token::Word(word) if word.quote_style.is_none() => Some(word.value.as_str()),
+            Token::Word(_) => Some(""),
+            _ => Some(""),
+        })
+        .is_some_and(|next| {
+            expected
+                .iter()
+                .any(|keyword| next.eq_ignore_ascii_case(keyword))
+        })
+}
+
+fn is_complete_statement_fragment(
+    fragment: &[TokenWithSpan],
+    end_location: sqlparser::tokenizer::Location,
+    dialect: &dyn Dialect,
+) -> bool {
+    let Some(last_significant) = fragment
+        .iter()
+        .rposition(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF))
+    else {
+        return false;
+    };
+    let closes_block = word_is(fragment, last_significant, "END");
+    if !has_balanced_module_blocks(fragment) {
+        return false;
+    }
+
+    let Some(end_span) = point_span(end_location) else {
+        return false;
+    };
+    let mut tokens = fragment.to_vec();
+    tokens.push(TokenWithSpan::new(Token::EOF, end_span));
+    let Ok(statements) = Parser::new(dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+    else {
+        return false;
+    };
+    if statements.len() != 1 {
+        return false;
+    }
+    !closes_block
+        || matches!(
+            statements.first(),
+            Some(Statement::If(_) | Statement::While(_) | Statement::StartTransaction { .. })
+        )
+}
+
+fn has_balanced_module_blocks(tokens: &[TokenWithSpan]) -> bool {
+    let mut block_depth = 0i32;
+    let mut case_depth = 0i32;
+    for (index, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if word.quote_style.is_some() {
+            continue;
+        }
+        if word.value.eq_ignore_ascii_case("CASE") {
+            case_depth += 1;
+        } else if word.value.eq_ignore_ascii_case("END") {
+            if case_depth > 0 {
+                case_depth -= 1;
+            } else if !mssql_word_follows(tokens, index, "CONVERSATION") {
+                block_depth -= 1;
+                if block_depth < 0 {
+                    return false;
+                }
+            }
+        } else if word.value.eq_ignore_ascii_case("BEGIN")
+            && !mssql_word_follows_any(tokens, index, MSSQL_BEGIN_NON_BLOCK_FOLLOWERS)
+        {
+            block_depth += 1;
+        }
+    }
+    block_depth == 0 && case_depth == 0
 }
 
 fn adapt_inline_table_function_return(tokens: &mut Vec<TokenWithSpan>) -> bool {
@@ -586,6 +1024,14 @@ fn word_is(tokens: &[TokenWithSpan], index: usize, expected: &str) -> bool {
         .is_some_and(|word| word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
 }
 
+fn word_is_token(token: &Token, expected: &str) -> bool {
+    matches!(
+        token,
+        Token::Word(word)
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
+    )
+}
+
 fn word(tokens: &[TokenWithSpan], index: usize) -> Option<&Word> {
     match &tokens.get(index)?.token {
         Token::Word(word) => Some(word),
@@ -746,6 +1192,175 @@ mod tests {
         };
         assert_eq!(name.to_string(), "refresh_cache");
         assert_eq!(params.as_ref().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn inserts_optional_terminators_only_at_valid_mssql_module_statement_boundaries() {
+        let cases = [
+            (
+                "-- café\r\nCREATE OR ALTER PROCEDURE dbo.synthetic_proc AS BEGIN\r\n DECLARE @value INT\r\n SELECT @value = 1\r\nEND",
+                2,
+            ),
+            (
+                "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN DECLARE @value INT SET @value = 1 SELECT @value END",
+                3,
+            ),
+        ];
+        for (sql, expected_body_statements) in cases {
+            let output = parse_sql_with_dialect_output(sql, FlowDialect::Mssql)
+                .expect("parse semicolon-optional procedure statements");
+            assert!(output.parser_fallback_used);
+            let [Statement::CreateProcedure { body, .. }] = output.statements.as_slice() else {
+                panic!("expected one CREATE PROCEDURE");
+            };
+            assert_eq!(body.statements().len(), expected_body_statements);
+            assert_eq!(
+                text_for_span(sql, body.span()),
+                sql.get(sql.find("BEGIN").unwrap()..).unwrap(),
+                "inserted punctuation must leave module body spans source-aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn repairs_optional_terminators_in_nested_mssql_control_flow_blocks() {
+        let sql = concat!(
+            "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN ",
+            "IF 1 = 1 BEGIN DECLARE @nested INT SELECT @nested = 2 END END"
+        );
+        let output = parse_sql_with_dialect_output(sql, FlowDialect::Mssql)
+            .expect("parse statements within nested BEGIN blocks");
+        let [Statement::CreateProcedure { body, .. }] = output.statements.as_slice() else {
+            panic!("expected one CREATE PROCEDURE");
+        };
+        let [Statement::If(if_statement)] = body.statements().as_slice() else {
+            panic!("expected one IF statement in procedure body");
+        };
+        let [Statement::Declare { .. }, Statement::Query(_)] =
+            if_statement.if_block.statements().as_slice()
+        else {
+            panic!("expected DECLARE and SELECT statements in the nested block");
+        };
+        assert_eq!(
+            text_for_span(sql, body.span()),
+            sql.get(sql.find("BEGIN").unwrap()..).unwrap(),
+            "nested block spans must refer to original source text"
+        );
+    }
+
+    #[test]
+    fn repairs_optional_terminators_in_standalone_mssql_begin_end_blocks() {
+        let cases = [
+            (
+                "BEGIN DECLARE @value INT SELECT @value = 1 END",
+                2,
+                "SELECT @value = 1",
+            ),
+            (
+                "-- café\r\nBEGIN DECLARE @value INT SELECT @value = 1 END;",
+                2,
+                "SELECT @value = 1",
+            ),
+            (
+                "BEGIN DECLARE @value INT SET @value = 1 SELECT @value END",
+                3,
+                "SELECT @value",
+            ),
+        ];
+        for (sql, expected_statements, expected_query_span) in cases {
+            let output = parse_sql_with_dialect_output(sql, FlowDialect::Mssql)
+                .expect("parse standalone BEGIN/END statements");
+            assert!(output.parser_fallback_used);
+            let [Statement::StartTransaction {
+                statements,
+                has_end_keyword: true,
+                ..
+            }] = output.statements.as_slice()
+            else {
+                panic!("expected a standalone BEGIN/END block");
+            };
+            assert_eq!(statements.len(), expected_statements);
+            let Some(Statement::Query(query)) = statements
+                .iter()
+                .find(|statement| matches!(statement, Statement::Query(_)))
+            else {
+                panic!("expected the source SELECT statement");
+            };
+            assert_eq!(
+                text_for_span(sql, query.span()),
+                expected_query_span,
+                "zero-width recovery punctuation must preserve query source spans"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_mssql_block_recovery_handles_nested_blocks_and_comments() {
+        let sql = concat!(
+            "BEGIN IF 1 = 1 BEGIN DECLARE @nested INT /* gap */ ",
+            "SELECT @nested = 2 END END"
+        );
+        let output = parse_sql_with_dialect_output(sql, FlowDialect::Mssql)
+            .expect("parse nested standalone BEGIN/END blocks");
+        let [Statement::StartTransaction { statements, .. }] = output.statements.as_slice() else {
+            panic!("expected a standalone BEGIN/END block");
+        };
+        let [Statement::If(if_statement)] = statements.as_slice() else {
+            panic!("expected one IF statement");
+        };
+        let [Statement::Declare { .. }, Statement::Query(query)] =
+            if_statement.if_block.statements().as_slice()
+        else {
+            panic!("expected DECLARE and SELECT inside the nested block");
+        };
+        assert_eq!(
+            text_for_span(sql, query.span()),
+            "SELECT @nested = 2",
+            "nested source spans must survive synthetic wrapper parsing"
+        );
+    }
+
+    #[test]
+    fn standalone_block_recovery_rejects_malformed_fragments_and_transaction_begin() {
+        for sql in [
+            "BEGIN DECLARE @value INT, SELECT @value = 1 END",
+            "BEGIN DECLARE @value INT SELECT FROM END",
+            "BEGIN DECLARE @value INT SELECT @value = 1, END",
+            "BEGIN DECLARE @value INT GO SELECT @value = 1 END",
+        ] {
+            assert!(
+                parse_sql_with_dialect_output(sql, FlowDialect::Mssql).is_err(),
+                "malformed SQL or a GO-separated fragment must not be repaired: {sql}"
+            );
+        }
+
+        let dialect = MsSqlDialect {};
+        let transaction_tokens = Tokenizer::new(&dialect, "BEGIN TRANSACTION; SELECT 1;")
+            .tokenize_with_location()
+            .expect("tokenize transaction");
+        assert!(
+            !is_standalone_mssql_begin_end_block(&transaction_tokens),
+            "transaction BEGIN must not be wrapped as a procedural block"
+        );
+        let transaction =
+            parse_sql_with_dialect_output("BEGIN TRANSACTION; SELECT 1;", FlowDialect::Mssql)
+                .expect("the primary parser should retain transaction behavior");
+        assert!(!transaction.parser_fallback_used);
+    }
+
+    #[test]
+    fn optional_terminator_recovery_keeps_malformed_fragments_and_go_errors() {
+        for sql in [
+            "CREATE PROCEDURE dbo.p AS BEGIN DECLARE @value INT, SELECT @value = 1 END",
+            "CREATE PROCEDURE dbo.p AS BEGIN DECLARE @value INT SELECT FROM END",
+            "CREATE PROCEDURE dbo.p AS BEGIN DECLARE @value INT SELECT @value = 1, END",
+            "CREATE PROCEDURE dbo.p AS BEGIN DECLARE @value INT GO SELECT @value = 1 END",
+        ] {
+            assert!(
+                parse_sql_with_dialect_output(sql, FlowDialect::Mssql).is_err(),
+                "malformed SQL or a GO-separated fragment must not be repaired: {sql}"
+            );
+        }
     }
 
     #[test]

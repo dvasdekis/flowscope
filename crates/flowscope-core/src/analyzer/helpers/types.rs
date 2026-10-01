@@ -58,6 +58,8 @@ pub fn infer_expr_type(expr: &Expr) -> Option<CanonicalType> {
             _ => None,
         },
         Expr::Cast { data_type, .. } => canonical_type_from_data_type(data_type),
+        Expr::TryParse { data_type, .. } => canonical_type_from_data_type(data_type),
+        Expr::Collate { expr, .. } => infer_expr_type(expr),
         Expr::TypedString(typed_string) => canonical_type_from_data_type(&typed_string.data_type),
         Expr::Nested(inner) => infer_expr_type(inner),
         Expr::UnaryOp { op, expr } => match op {
@@ -391,6 +393,17 @@ mod tests {
             infer_expr_type(&parse_expr("CAST(x AS MY_CUSTOM_UDT)")),
             None
         );
+    }
+
+    #[test]
+    fn test_try_parse_infers_its_target_type() {
+        let expr = Expr::TryParse {
+            expr: Box::new(parse_expr("'2024-01-02'")),
+            data_type: ast::DataType::Datetime(None),
+            culture: Some(Box::new(parse_expr("'en-US'"))),
+        };
+
+        assert_eq!(infer_expr_type(&expr), Some(CanonicalType::Timestamp));
     }
 
     #[test]

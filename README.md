@@ -124,6 +124,7 @@ See [CLI documentation](crates/flowscope-cli/README.md) for all options.
 
 - `app/` — the hosted web application at [flowscope.pondpilot.io](https://flowscope.pondpilot.io)
 - `crates/` — Rust engine, WASM bindings, and CLI
+- `vendor/sqlparser/` — publishable `flowscope-sqlparser` fork of upstream 0.61.0 with typed MSSQL `TRY_PARSE` support
 - `packages/` — published TypeScript API and private React visualization workspace
 
 ## TypeScript API
@@ -204,6 +205,14 @@ to npm. See [docs/guides/quickstart.md](docs/guides/quickstart.md) for a core AP
 ## Development
 
 FlowScope uses `just` for common tasks. Run `just build`, `just test`, or `just dev`, and see [docs/workspace-structure.md](docs/workspace-structure.md) for the full command list.
+
+The checked-in browser WASM receives an additional size-optimization pass with Binaryen 117 after the normal release build. With that version of `wasm-opt` available, reproduce the extra pass after `just build-wasm`:
+
+```sh
+wasm-opt -Oz packages/core/wasm/flowscope_wasm_bg.wasm -o packages/core/wasm/flowscope_wasm_bg.wasm
+```
+
+The app's 9 MiB WASM budget remains enforced; the normal optimized release build also fits without this optional extra pass.
 
 ## Contributing
 

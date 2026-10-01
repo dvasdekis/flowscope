@@ -114,12 +114,15 @@ jobs:
           echo "Embedded assets verified ($file_count files):"
           ls -la crates/flowscope-cli/embedded-app/
 
-      - name: Dry-run publish crates
+      - name: Verify crate packages with staged workspace dependencies
         if: ${{ env.DRY_RUN == 'true' }}
         run: |
-          cargo publish -p flowscope-core --dry-run --locked --allow-dirty
-          cargo publish -p flowscope-export --dry-run --locked
-          cargo publish -p flowscope-cli --dry-run --locked --allow-dirty
+          cargo package \
+            -p flowscope-sqlparser \
+            -p flowscope-core \
+            -p flowscope-export \
+            -p flowscope-cli \
+            --locked --allow-dirty
 
       - name: Publish crates
         if: ${{ env.DRY_RUN != 'true' }}
@@ -129,7 +132,7 @@ jobs:
             exit 1
           fi
           VERSION="${{ steps.crate_version.outputs.workspace_version }}"
-          for CRATE in flowscope-core flowscope-export flowscope-cli; do
+          for CRATE in flowscope-sqlparser flowscope-core flowscope-export flowscope-cli; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "User-Agent: flowscope-ci" \
               -H "Accept: application/json" \

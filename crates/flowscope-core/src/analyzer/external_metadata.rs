@@ -7,7 +7,7 @@
 use crate::error::{ParseError, ParseErrorKind};
 use crate::parser::parse_sql_with_dialect_output;
 use crate::types::{issue_codes, Dialect, Issue};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, FunctionArguments, SetExpr, Statement};
 use sqlparser::dialect::MsSqlDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
@@ -117,7 +117,7 @@ pub(crate) fn parse_external_metadata_statement(
         .peek()
         .is_some_and(|token| is_keyword(&token.token, "IF"))
     {
-        return parser.parse_conditional_file_format();
+        return parser.parse_conditional_external_metadata();
     }
     if !parser.consume_keyword("CREATE") || !parser.consume_keyword("EXTERNAL") {
         return Ok(None);
@@ -274,6 +274,13 @@ struct ExternalMetadataParser<'a> {
     position: usize,
     statement_name: &'static str,
     object_name: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConditionalExternalMetadataGuard {
+    NotExists,
+    Exists,
+    ObjectId,
 }
 
 impl<'a> ExternalMetadataParser<'a> {
@@ -462,22 +469,67 @@ impl<'a> ExternalMetadataParser<'a> {
             |token| matches!(token, Token::LParen),
             "opening parenthesis after external table WITH",
         )?;
-        self.expect_keyword("LOCATION")?;
-        self.expect_equals("after LOCATION")?;
-        let (location, location_token) = self.parse_string_value_with_token("LOCATION")?;
-        if location.is_empty() {
-            return Err(self.error_at(
-                Some(location_token),
-                "LOCATION must not be empty",
+        let mut saw_location = false;
+        let mut saw_data_source = false;
+        for _ in 0..2 {
+            let Some(option_token) = self.peek() else {
+                return Err(self.error(
+                    "Expected LOCATION and DATA_SOURCE before FILE_FORMAT",
+                    ParseErrorKind::UnexpectedEof,
+                ));
+            };
+            if is_keyword(&option_token.token, "LOCATION") {
+                if saw_location {
+                    return Err(self.error_at(
+                        Some(option_token),
+                        "Duplicate LOCATION option in CREATE EXTERNAL TABLE",
+                        ParseErrorKind::SyntaxError,
+                    ));
+                }
+                saw_location = true;
+                self.position += 1;
+                self.expect_equals("after LOCATION")?;
+                let (location, location_token) = self.parse_string_value_with_token("LOCATION")?;
+                if location.is_empty() {
+                    return Err(self.error_at(
+                        Some(location_token),
+                        "LOCATION must not be empty",
+                        ParseErrorKind::SyntaxError,
+                    ));
+                }
+            } else if is_keyword(&option_token.token, "DATA_SOURCE") {
+                if saw_data_source {
+                    return Err(self.error_at(
+                        Some(option_token),
+                        "Duplicate DATA_SOURCE option in CREATE EXTERNAL TABLE",
+                        ParseErrorKind::SyntaxError,
+                    ));
+                }
+                saw_data_source = true;
+                self.position += 1;
+                self.expect_equals("after DATA_SOURCE")?;
+                let _data_source = self.parse_object_name(1)?;
+            } else if is_keyword(&option_token.token, "FILE_FORMAT") {
+                return Err(self.error_at(
+                    Some(option_token),
+                    "FILE_FORMAT must follow LOCATION and DATA_SOURCE",
+                    ParseErrorKind::SyntaxError,
+                ));
+            } else {
+                return Err(self.error_at(
+                    Some(option_token),
+                    "Expected LOCATION or DATA_SOURCE before FILE_FORMAT",
+                    ParseErrorKind::SyntaxError,
+                ));
+            }
+            self.expect_comma("between external table options")?;
+        }
+        if !saw_location || !saw_data_source {
+            return Err(self.error(
+                "CREATE EXTERNAL TABLE requires LOCATION and DATA_SOURCE before FILE_FORMAT",
                 ParseErrorKind::SyntaxError,
             ));
         }
-        self.expect_comma("after LOCATION")?;
-
-        self.expect_keyword("DATA_SOURCE")?;
-        self.expect_equals("after DATA_SOURCE")?;
-        let _data_source = self.parse_object_name(1)?;
-        self.expect_comma("after DATA_SOURCE")?;
 
         self.expect_keyword("FILE_FORMAT")?;
         self.expect_equals("after FILE_FORMAT")?;
@@ -499,27 +551,334 @@ impl<'a> ExternalMetadataParser<'a> {
         ))
     }
 
-    fn parse_conditional_file_format(
+    fn parse_conditional_external_metadata(
         &mut self,
     ) -> Result<Option<ExternalMetadataStatement>, ParseError> {
-        if !self.tokens.iter().enumerate().any(|(index, token)| {
-            is_keyword(&token.token, "CREATE")
-                && self.tokens.get(index + 1).is_some_and(|next| {
-                    is_keyword(&next.token, "EXTERNAL")
-                        && self.tokens.get(index + 2).is_some_and(|next| {
-                            is_keyword(&next.token, "FILE")
-                                && self
-                                    .tokens
-                                    .get(index + 3)
-                                    .is_some_and(|next| is_keyword(&next.token, "FORMAT"))
-                        })
-                })
-        }) {
+        let Some(guard) = self.conditional_external_metadata_guard() else {
             return Ok(None);
+        };
+
+        self.statement_name = "conditional external metadata";
+        self.consume_keyword("IF");
+        match guard {
+            ConditionalExternalMetadataGuard::NotExists => {
+                self.parse_if_not_exists_condition()?;
+            }
+            ConditionalExternalMetadataGuard::Exists => {
+                return Err(self.error(
+                    "Expected NOT in conditional external metadata",
+                    ParseErrorKind::SyntaxError,
+                ));
+            }
+            ConditionalExternalMetadataGuard::ObjectId => {
+                self.parse_object_id_is_null_condition()?;
+            }
+        }
+        let block_body = self.consume_keyword("BEGIN");
+        let body_start_position = self.position;
+        let body_start_token = self.tokens.get(body_start_position).copied().ok_or_else(|| {
+            self.error(
+                "Expected CREATE EXTERNAL FILE FORMAT or typed CREATE EXTERNAL TABLE after the conditional guard",
+                ParseErrorKind::UnexpectedEof,
+            )
+        })?;
+        let starts_external_create = is_keyword(&body_start_token.token, "CREATE")
+            && self
+                .tokens
+                .get(body_start_position + 1)
+                .is_some_and(|token| is_keyword(&token.token, "EXTERNAL"));
+        let body_kind = self.tokens.get(body_start_position + 2);
+        let is_supported_body_kind = body_kind.is_some_and(|token| {
+            is_keyword(&token.token, "TABLE")
+                || (is_keyword(&token.token, "FILE")
+                    && self
+                        .tokens
+                        .get(body_start_position + 3)
+                        .is_some_and(|token| is_keyword(&token.token, "FORMAT")))
+        });
+        if !starts_external_create || !is_supported_body_kind {
+            return Err(self.error_at(
+                Some(body_start_token),
+                "Expected CREATE EXTERNAL FILE FORMAT or typed CREATE EXTERNAL TABLE as the conditional guard body",
+                ParseErrorKind::SyntaxError,
+            ));
+        }
+        let body_start = token_byte_range(self.source_sql, body_start_token)
+            .ok_or_else(|| {
+                self.error_at(
+                    Some(body_start_token),
+                    "Could not determine the conditional external metadata source range",
+                    ParseErrorKind::SyntaxError,
+                )
+            })?
+            .start;
+
+        let end_position = if block_body {
+            Some(
+                (self.position..self.tokens.len())
+                    .find(|position| is_keyword(&self.tokens[*position].token, "END"))
+                    .ok_or_else(|| {
+                        self.error(
+                            "Expected END after conditional external metadata",
+                            ParseErrorKind::UnexpectedEof,
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let body_end = match end_position {
+            Some(end_position) => {
+                token_byte_range(self.source_sql, self.tokens[end_position])
+                    .ok_or_else(|| {
+                        self.error_at(
+                            Some(self.tokens[end_position]),
+                            "Could not determine the conditional block source range",
+                            ParseErrorKind::SyntaxError,
+                        )
+                    })?
+                    .start
+            }
+            None => self.source_sql.len(),
+        };
+        let body_sql = self.source_sql.get(body_start..body_end).ok_or_else(|| {
+            self.error(
+                "Could not read the conditional external metadata source range",
+                ParseErrorKind::SyntaxError,
+            )
+        })?;
+        let body = parse_external_metadata_statement(body_sql)
+            .map_err(|error| map_fragment_error(self.source_sql, body_sql, body_start, error))?;
+        let Some(body) = body else {
+            return Err(self.error_at(
+                Some(body_start_token),
+                "Expected CREATE EXTERNAL FILE FORMAT or typed CREATE EXTERNAL TABLE as the conditional guard body",
+                ParseErrorKind::SyntaxError,
+            ));
+        };
+        let conditional_body = match body {
+            ExternalMetadataStatement::FileFormat(format) => {
+                ExternalMetadataStatement::ConditionalFileFormat(format)
+            }
+            table @ ExternalMetadataStatement::ExternalTable(_) => table,
+            ExternalMetadataStatement::ConditionalFileFormat(_)
+            | ExternalMetadataStatement::Cetas(_) => {
+                return Err(self.error_at(
+                    Some(body_start_token),
+                    "Conditional metadata guards support only CREATE EXTERNAL FILE FORMAT or typed CREATE EXTERNAL TABLE bodies",
+                    ParseErrorKind::UnsupportedFeature,
+                ));
+            }
+        };
+
+        if let Some(end_position) = end_position {
+            self.position = end_position + 1;
+            self.consume_token(|token| matches!(token, Token::SemiColon));
+            if self.peek().is_some() {
+                return Err(self.error(
+                    "Unexpected token after conditional external metadata",
+                    ParseErrorKind::SyntaxError,
+                ));
+            }
+        }
+        Ok(Some(conditional_body))
+    }
+
+    fn conditional_external_metadata_guard(&self) -> Option<ConditionalExternalMetadataGuard> {
+        if !self
+            .tokens
+            .first()
+            .is_some_and(|token| is_keyword(&token.token, "IF"))
+        {
+            return None;
         }
 
-        self.statement_name = "conditional CREATE EXTERNAL FILE FORMAT";
-        self.consume_keyword("IF");
+        if self
+            .tokens
+            .get(1)
+            .is_some_and(|token| is_keyword(&token.token, "NOT"))
+            && self
+                .tokens
+                .get(2)
+                .is_some_and(|token| is_keyword(&token.token, "EXISTS"))
+            && self
+                .parenthesized_guard_body_start(3)
+                .is_some_and(|position| self.external_metadata_body_start(position).is_some())
+        {
+            return Some(ConditionalExternalMetadataGuard::NotExists);
+        }
+
+        if self
+            .tokens
+            .get(1)
+            .is_some_and(|token| is_keyword(&token.token, "EXISTS"))
+            && self
+                .parenthesized_guard_body_start(2)
+                .is_some_and(|position| self.external_metadata_body_start(position).is_some())
+        {
+            return Some(ConditionalExternalMetadataGuard::Exists);
+        }
+
+        if self
+            .tokens
+            .get(1)
+            .is_some_and(|token| is_keyword(&token.token, "OBJECT_ID"))
+            && self
+                .object_id_guard_body_start()
+                .is_some_and(|position| self.external_metadata_body_start(position).is_some())
+        {
+            return Some(ConditionalExternalMetadataGuard::ObjectId);
+        }
+
+        None
+    }
+
+    fn parenthesized_guard_body_start(&self, condition_start: usize) -> Option<usize> {
+        if self
+            .tokens
+            .get(condition_start)
+            .is_some_and(|token| matches!(&token.token, Token::LParen))
+        {
+            self.after_matching_parenthesis(condition_start)
+        } else {
+            Some(condition_start)
+        }
+    }
+
+    fn object_id_guard_body_start(&self) -> Option<usize> {
+        self.object_id_guard_body_start_at(0)
+    }
+
+    fn object_id_guard_body_start_at(&self, if_position: usize) -> Option<usize> {
+        let function_open = if_position + 2;
+        let after_function = if self
+            .tokens
+            .get(function_open)
+            .is_some_and(|token| matches!(&token.token, Token::LParen))
+        {
+            self.after_matching_parenthesis(function_open)
+                .or_else(|| self.object_id_null_test_end(function_open + 1))
+                .unwrap_or(function_open + 1)
+        } else {
+            function_open
+        };
+
+        Some(
+            self.object_id_null_test_end(after_function)
+                .unwrap_or(after_function),
+        )
+    }
+
+    fn object_id_null_test_end(&self, start: usize) -> Option<usize> {
+        for (position, token) in self.tokens.iter().enumerate().skip(start) {
+            if !is_keyword(&token.token, "IS") {
+                continue;
+            }
+            let mut after_test = position + 1;
+            if self
+                .tokens
+                .get(after_test)
+                .is_some_and(|token| is_keyword(&token.token, "NOT"))
+            {
+                after_test += 1;
+            }
+            if self
+                .tokens
+                .get(after_test)
+                .is_some_and(|token| is_keyword(&token.token, "NULL"))
+            {
+                return Some(after_test + 1);
+            }
+            return Some(position + 1);
+        }
+        None
+    }
+
+    fn external_metadata_body_start(&self, position: usize) -> Option<usize> {
+        self.direct_external_metadata_body_start(position)
+            .or_else(|| {
+                let body_start = if self
+                    .tokens
+                    .get(position)
+                    .is_some_and(|token| is_keyword(&token.token, "BEGIN"))
+                {
+                    position + 1
+                } else {
+                    position
+                };
+                self.nested_guard_contains_external_metadata(body_start)
+                    .then_some(body_start)
+            })
+    }
+
+    fn direct_external_metadata_body_start(&self, position: usize) -> Option<usize> {
+        let body_start = if self
+            .tokens
+            .get(position)
+            .is_some_and(|token| is_keyword(&token.token, "BEGIN"))
+        {
+            position + 1
+        } else {
+            position
+        };
+        let is_create_external = is_keyword(&self.tokens.get(body_start)?.token, "CREATE")
+            && self
+                .tokens
+                .get(body_start + 1)
+                .is_some_and(|token| is_keyword(&token.token, "EXTERNAL"));
+        let body_kind = self.tokens.get(body_start + 2);
+        let supported_body_kind = body_kind.is_some_and(|token| {
+            is_keyword(&token.token, "TABLE")
+                || (is_keyword(&token.token, "FILE")
+                    && self
+                        .tokens
+                        .get(body_start + 3)
+                        .is_some_and(|token| is_keyword(&token.token, "FORMAT")))
+        });
+        (is_create_external && supported_body_kind).then_some(body_start)
+    }
+
+    fn nested_guard_contains_external_metadata(&self, if_position: usize) -> bool {
+        if !self
+            .tokens
+            .get(if_position)
+            .is_some_and(|token| is_keyword(&token.token, "IF"))
+        {
+            return false;
+        }
+
+        let body_position = if self
+            .tokens
+            .get(if_position + 1)
+            .is_some_and(|token| is_keyword(&token.token, "NOT"))
+            && self
+                .tokens
+                .get(if_position + 2)
+                .is_some_and(|token| is_keyword(&token.token, "EXISTS"))
+        {
+            self.parenthesized_guard_body_start(if_position + 3)
+        } else if self
+            .tokens
+            .get(if_position + 1)
+            .is_some_and(|token| is_keyword(&token.token, "EXISTS"))
+        {
+            self.parenthesized_guard_body_start(if_position + 2)
+        } else if self
+            .tokens
+            .get(if_position + 1)
+            .is_some_and(|token| is_keyword(&token.token, "OBJECT_ID"))
+        {
+            self.object_id_guard_body_start_at(if_position)
+        } else {
+            None
+        };
+
+        body_position
+            .and_then(|position| self.direct_external_metadata_body_start(position))
+            .is_some()
+    }
+
+    fn parse_if_not_exists_condition(&mut self) -> Result<(), ParseError> {
         self.expect_keyword("NOT")?;
         self.expect_keyword("EXISTS")?;
         let open_position = self.position;
@@ -583,79 +942,176 @@ impl<'a> ExternalMetadataParser<'a> {
             ));
         }
         self.position = close_after_condition;
-        let block_body = self.consume_keyword("BEGIN");
-        let body_start_position = self.position;
-        self.expect_keyword("CREATE")?;
-        self.expect_keyword("EXTERNAL")?;
-        self.expect_keyword("FILE")?;
-        self.expect_keyword("FORMAT")?;
-        let body_start = token_byte_range(self.source_sql, self.tokens[body_start_position])
-            .ok_or_else(|| {
-                self.error_at(
-                    self.tokens.get(body_start_position).copied(),
-                    "Could not determine the external file format source range",
-                    ParseErrorKind::SyntaxError,
-                )
-            })?
-            .start;
+        Ok(())
+    }
 
-        let end_position = if block_body {
-            Some(
-                (self.position..self.tokens.len())
-                    .find(|position| is_keyword(&self.tokens[*position].token, "END"))
-                    .ok_or_else(|| {
-                        self.error(
-                            "Expected END after conditional CREATE EXTERNAL FILE FORMAT",
-                            ParseErrorKind::UnexpectedEof,
-                        )
-                    })?,
-            )
+    fn parse_object_id_is_null_condition(&mut self) -> Result<(), ParseError> {
+        let function_start = self.position;
+        let function_token = self.peek();
+        self.expect_keyword("OBJECT_ID")?;
+        let open_position = self.position;
+        self.expect_token(
+            |token| matches!(token, Token::LParen),
+            "opening parenthesis after OBJECT_ID",
+        )?;
+        let close_after_function =
+            self.after_matching_parenthesis(open_position)
+                .ok_or_else(|| {
+                    self.error_at(
+                        Some(self.tokens[open_position]),
+                        "Expected a closing parenthesis after OBJECT_ID arguments",
+                        ParseErrorKind::SyntaxError,
+                    )
+                })?;
+        let close_position = close_after_function - 1;
+        self.position = close_after_function;
+        self.expect_keyword("IS")?;
+        let not_token = if self
+            .peek()
+            .is_some_and(|token| is_keyword(&token.token, "NOT"))
+        {
+            let token = self.peek();
+            self.position += 1;
+            token
         } else {
             None
         };
-        let body_end = match end_position {
-            Some(end_position) => {
-                token_byte_range(self.source_sql, self.tokens[end_position])
-                    .ok_or_else(|| {
-                        self.error_at(
-                            Some(self.tokens[end_position]),
-                            "Could not determine the conditional block source range",
-                            ParseErrorKind::SyntaxError,
-                        )
-                    })?
-                    .start
-            }
-            None => self.source_sql.len(),
-        };
-        let body_sql = self.source_sql.get(body_start..body_end).ok_or_else(|| {
-            self.error(
-                "Could not read the conditional external file format source range",
-                ParseErrorKind::SyntaxError,
-            )
-        })?;
-        let body = parse_external_metadata_statement(body_sql)
-            .map_err(|error| map_fragment_error(self.source_sql, body_sql, body_start, error))?;
-        let Some(ExternalMetadataStatement::FileFormat(format)) = body else {
+        self.expect_keyword("NULL")?;
+        let null_position = self.position - 1;
+
+        let condition_range = token_byte_range(self.source_sql, self.tokens[function_start])
+            .zip(token_byte_range(
+                self.source_sql,
+                self.tokens[null_position],
+            ))
+            .map(|(start, end)| start.start..end.end)
+            .ok_or_else(|| {
+                self.error_at(
+                    function_token,
+                    "Could not determine the OBJECT_ID condition source range",
+                    ParseErrorKind::SyntaxError,
+                )
+            })?;
+        let condition_sql = self
+            .source_sql
+            .get(condition_range.clone())
+            .ok_or_else(|| {
+                self.error(
+                    "Could not read the OBJECT_ID condition source range",
+                    ParseErrorKind::SyntaxError,
+                )
+            })?;
+        let prefix = "SELECT 1 WHERE ";
+        let adapted_sql = format!("{prefix}{condition_sql}");
+        let condition_output = parse_sql_with_dialect_output(&adapted_sql, Dialect::Mssql)
+            .map_err(|error| {
+                map_adapted_columns_error(
+                    self.source_sql,
+                    &adapted_sql,
+                    prefix.len(),
+                    condition_range.start,
+                    error,
+                )
+            })?;
+
+        let [Statement::Query(query)] = condition_output.statements.as_slice() else {
             return Err(self.error_at(
-                Some(self.tokens[body_start_position]),
-                "Expected CREATE EXTERNAL FILE FORMAT as the IF NOT EXISTS body",
+                function_token,
+                "OBJECT_ID guard requires one valid MSSQL condition expression",
                 ParseErrorKind::SyntaxError,
             ));
         };
-
-        if let Some(end_position) = end_position {
-            self.position = end_position + 1;
-            self.consume_token(|token| matches!(token, Token::SemiColon));
-            if self.peek().is_some() {
-                return Err(self.error(
-                    "Unexpected token after conditional CREATE EXTERNAL FILE FORMAT",
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(self.error_at(
+                function_token,
+                "OBJECT_ID guard requires a SELECT condition expression",
+                ParseErrorKind::SyntaxError,
+            ));
+        };
+        let Some(condition) = select.selection.as_ref() else {
+            return Err(self.error_at(
+                function_token,
+                "OBJECT_ID guard requires an IS NULL condition",
+                ParseErrorKind::SyntaxError,
+            ));
+        };
+        let object_id_expression = match condition {
+            Expr::IsNull(expression) if not_token.is_none() => expression.as_ref(),
+            Expr::IsNotNull(expression) if not_token.is_some() => expression.as_ref(),
+            _ => {
+                return Err(self.error_at(
+                    Some(self.tokens[null_position]),
+                    "OBJECT_ID guard condition must be OBJECT_ID(...) IS NULL",
                     ParseErrorKind::SyntaxError,
                 ));
             }
+        };
+        let Expr::Function(function) = object_id_expression else {
+            return Err(self.error_at(
+                function_token,
+                "OBJECT_ID guard requires an OBJECT_ID function call",
+                ParseErrorKind::SyntaxError,
+            ));
+        };
+        let function_name = function.name.0.first().and_then(|part| part.as_ident());
+        if function.name.0.len() != 1
+            || !function_name.is_some_and(|name| name.value.eq_ignore_ascii_case("OBJECT_ID"))
+        {
+            return Err(self.error_at(
+                function_token,
+                "OBJECT_ID guard requires the unqualified OBJECT_ID function",
+                ParseErrorKind::SyntaxError,
+            ));
         }
-        Ok(Some(ExternalMetadataStatement::ConditionalFileFormat(
-            format,
-        )))
+
+        let FunctionArguments::List(arguments) = &function.args else {
+            return Err(self.error_at(
+                function_token,
+                "OBJECT_ID guard requires a literal object name",
+                ParseErrorKind::SyntaxError,
+            ));
+        };
+        if arguments.args.is_empty() {
+            return Err(self.error_at(
+                Some(self.tokens[close_position]),
+                "OBJECT_ID guard requires a literal object name",
+                ParseErrorKind::SyntaxError,
+            ));
+        }
+        let argument_tokens = &self.tokens[open_position + 1..close_position];
+        let expected_arguments = match argument_tokens {
+            [name] if is_object_id_string_literal(&name.token) => 1,
+            [name, comma, object_type]
+                if is_object_id_string_literal(&name.token)
+                    && matches!(&comma.token, Token::Comma)
+                    && is_object_id_string_literal(&object_type.token) =>
+            {
+                2
+            }
+            _ => {
+                let token = argument_tokens.first().copied();
+                return Err(self.error_at(
+                    token.or(Some(self.tokens[close_position])),
+                    "OBJECT_ID guard supports a literal object name and optional literal object type",
+                    ParseErrorKind::UnsupportedFeature,
+                ));
+            }
+        };
+        if arguments.args.len() != expected_arguments {
+            return Err(self.error_at(
+                function_token,
+                "OBJECT_ID guard supports one or two literal arguments",
+                ParseErrorKind::SyntaxError,
+            ));
+        }
+        if let Some(not_token) = not_token {
+            return Err(self.error_at(
+                Some(not_token),
+                "OBJECT_ID IS NOT NULL guards are not supported",
+                ParseErrorKind::UnsupportedFeature,
+            ));
+        }
+        Ok(())
     }
 
     fn parse_cetas_output_columns(&mut self) -> Result<Vec<String>, ParseError> {
@@ -1208,6 +1664,13 @@ fn is_keyword(token: &Token, keyword: &str) -> bool {
     )
 }
 
+fn is_object_id_string_literal(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::SingleQuotedString(_) | Token::NationalStringLiteral(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1843,61 @@ mod tests {
     }
 
     #[test]
+    fn accepts_location_and_data_source_in_either_order_for_tables_and_guards() {
+        let cases = [
+            concat!(
+                "CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+                "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+                "FILE_FORMAT = synthetic_format)"
+            ),
+            concat!(
+                "/* café */ CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+                "(DATA_SOURCE = synthetic_store, /* option comment */ ",
+                "LOCATION = N'demo/', FILE_FORMAT = synthetic_format)"
+            ),
+            concat!(
+                "IF NOT EXISTS (SELECT 1 FROM sys.external_tables ",
+                "WHERE name = 'synthetic_demo') ",
+                "CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+                "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+                "FILE_FORMAT = synthetic_format);"
+            ),
+            concat!(
+                "IF OBJECT_ID(N'dbo.synthetic_demo', N'U') IS NULL ",
+                "CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+                "(DATA_SOURCE = synthetic_store, LOCATION = N'demo/', ",
+                "FILE_FORMAT = synthetic_format);"
+            ),
+            concat!(
+                "IF NOT EXISTS (SELECT 1 FROM sys.external_tables ",
+                "WHERE name = 'synthetic_demo') BEGIN\r\n",
+                "CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+                "(DATA_SOURCE = synthetic_store, LOCATION = N'demo/', ",
+                "FILE_FORMAT = synthetic_format);\r\n",
+                "END"
+            ),
+            concat!(
+                "/* café */ IF OBJECT_ID('dbo.synthetic_demo') IS NULL BEGIN\n",
+                "CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+                "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+                "FILE_FORMAT = synthetic_format);\n",
+                "END"
+            ),
+        ];
+
+        let expected_name = vec!["dbo".to_string(), "synthetic_demo".to_string()];
+        for sql in cases {
+            let metadata = parse_format(sql)
+                .expect("valid external-table option order")
+                .expect("external-table metadata");
+            let ExternalMetadataStatement::ExternalTable(table) = metadata else {
+                panic!("guarded external tables must reuse the existing metadata variant");
+            };
+            assert_eq!(table.name, expected_name);
+        }
+    }
+
+    #[test]
     fn parses_guarded_external_file_format_without_skipping_the_if_query() {
         let sql = concat!(
             "IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",
@@ -1401,6 +1919,369 @@ mod tests {
             .unsupported_lineage_warning()
             .message
             .contains("external-file lineage is not modeled"));
+    }
+
+    #[test]
+    fn parses_bare_and_block_guarded_external_tables_as_metadata_only() {
+        let cases = [
+            concat!(
+                "/* café */ IF NOT EXISTS (SELECT 1 FROM sys.external_tables ",
+                "WHERE name = 'synthetic_demo') ",
+                "CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) ",
+                "WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+                "FILE_FORMAT = synthetic_format);"
+            ),
+            concat!(
+                "-- Unicode and CRLF source positions stay in the original SQL.\r\n",
+                "IF NOT EXISTS (\r\n",
+                "    SELECT 1 FROM sys.external_tables\r\n",
+                "    WHERE name = 'synthetic_demo'\r\n",
+                ") /* condition comment */ BEGIN\r\n",
+                "    -- END in a comment is not the block terminator.\r\n",
+                "    CREATE /* body comment */ EXTERNAL TABLE dbo.synthetic_demo ",
+                "(id INT, label VARCHAR(20)) WITH (LOCATION = 'demo/BEGIN; END ELSE', ",
+                "DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format);\r\n",
+                "END; -- trailing comment"
+            ),
+        ];
+
+        for sql in cases {
+            let metadata = parse_format(sql)
+                .expect("valid guarded external table")
+                .expect("external table metadata");
+            let ExternalMetadataStatement::ExternalTable(table) = &metadata else {
+                panic!("guarded external table should reuse the external-table metadata variant");
+            };
+
+            assert_eq!(
+                table.name,
+                vec!["dbo".to_string(), "synthetic_demo".to_string()]
+            );
+            assert_eq!(metadata.statement_type(), "CREATE_EXTERNAL_TABLE");
+            assert!(metadata
+                .unsupported_lineage_warning()
+                .message
+                .contains("external-file lineage is not modeled"));
+        }
+    }
+
+    #[test]
+    fn parses_object_id_guarded_external_tables_and_file_formats() {
+        let bare_table = concat!(
+            "IF OBJECT_ID(N'dbo.synthetic_rows', N'U') IS NULL ",
+            "CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+            "FILE_FORMAT = synthetic_format);"
+        );
+        let metadata = parse_format(bare_table)
+            .expect("valid OBJECT_ID guarded table")
+            .expect("external table metadata");
+        let ExternalMetadataStatement::ExternalTable(table) = &metadata else {
+            panic!("OBJECT_ID guarded table should use the existing table variant");
+        };
+        assert_eq!(
+            table.name,
+            vec!["dbo".to_string(), "synthetic_rows".to_string()]
+        );
+        assert_eq!(metadata.statement_type(), "CREATE_EXTERNAL_TABLE");
+
+        let block_table = concat!(
+            "/* café */ IF OBJECT_ID('dbo.synthetic_demo') IS NULL BEGIN\r\n",
+            "  -- The END in this comment is not a terminator.\r\n",
+            "  CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+            "(LOCATION = 'demo/END', DATA_SOURCE = synthetic_store, ",
+            "FILE_FORMAT = synthetic_format);\r\n",
+            "END"
+        );
+        assert!(matches!(
+            parse_format(block_table)
+                .expect("valid OBJECT_ID block guard")
+                .expect("external table metadata"),
+            ExternalMetadataStatement::ExternalTable(_)
+        ));
+
+        let file_format = concat!(
+            "IF OBJECT_ID('synthetic_format') IS NULL BEGIN ",
+            "CREATE EXTERNAL FILE FORMAT synthetic_format WITH (FORMAT_TYPE = PARQUET); ",
+            "END"
+        );
+        let metadata = parse_format(file_format)
+            .expect("valid OBJECT_ID guarded file format")
+            .expect("file format metadata");
+        let ExternalMetadataStatement::ConditionalFileFormat(format) = metadata else {
+            panic!("OBJECT_ID guarded file format should retain its conditional variant");
+        };
+        assert_eq!(format.name, vec!["synthetic_format"]);
+        assert_eq!(format.format, ExternalFileFormatType::Parquet);
+    }
+
+    #[test]
+    fn parses_measured_synthetic_object_id_guard_and_unguarded_control() {
+        let guarded = concat!(
+            "IF OBJECT_ID(N'dbo.synthetic_ext', N'U') IS NULL\n",
+            "BEGIN\n",
+            "    CREATE EXTERNAL TABLE dbo.synthetic_ext (\n",
+            "        id INT\n",
+            "    )\n",
+            "    WITH (\n",
+            "        LOCATION = 'synthetic/path/',\n",
+            "        DATA_SOURCE = synthetic_source,\n",
+            "        FILE_FORMAT = synthetic_format\n",
+            "    );\n",
+            "END;"
+        );
+        let bare_guarded = concat!(
+            "IF OBJECT_ID(N'dbo.synthetic_ext', N'U') IS NULL\n",
+            "    CREATE EXTERNAL TABLE dbo.synthetic_ext (\n",
+            "        id INT\n",
+            "    )\n",
+            "    WITH (\n",
+            "        LOCATION = 'synthetic/path/',\n",
+            "        DATA_SOURCE = synthetic_source,\n",
+            "        FILE_FORMAT = synthetic_format\n",
+            "    );"
+        );
+        let unguarded = concat!(
+            "CREATE EXTERNAL TABLE dbo.synthetic_ext (\n",
+            "    id INT\n",
+            ")\n",
+            "WITH (\n",
+            "    LOCATION = 'synthetic/path/',\n",
+            "    DATA_SOURCE = synthetic_source,\n",
+            "    FILE_FORMAT = synthetic_format\n",
+            ");"
+        );
+
+        let guarded_metadata = parse_format(guarded)
+            .expect("valid measured-shape guard")
+            .expect("guarded external-table metadata");
+        let bare_metadata = parse_format(bare_guarded)
+            .expect("valid unbraced measured-shape guard")
+            .expect("guarded external-table metadata");
+        let unguarded_metadata = parse_format(unguarded)
+            .expect("valid unguarded control")
+            .expect("external-table metadata");
+        assert_eq!(
+            guarded_metadata, unguarded_metadata,
+            "the IF OBJECT_ID wrapper must preserve typed external-table metadata"
+        );
+        assert_eq!(
+            bare_metadata, unguarded_metadata,
+            "the unbraced IF OBJECT_ID wrapper must preserve typed external-table metadata"
+        );
+        assert_eq!(guarded_metadata.statement_type(), "CREATE_EXTERNAL_TABLE");
+    }
+
+    #[test]
+    fn object_id_guarded_external_table_analysis_has_no_fake_lineage() {
+        let sql = concat!(
+            "IF OBJECT_ID(N'dbo.synthetic_rows', N'U') IS NULL ",
+            "CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+            "FILE_FORMAT = synthetic_format)"
+        );
+        let request = crate::types::AnalyzeRequest {
+            sql: sql.to_string(),
+            files: None,
+            dialect: Dialect::Mssql,
+            source_name: Some("object-id-external-table.sql".to_string()),
+            options: None,
+            schema: None,
+            #[cfg(feature = "templating")]
+            template_config: None,
+        };
+
+        let result = super::super::analyze(&request);
+
+        assert_eq!(result.statements.len(), 1);
+        assert_eq!(result.statements[0].statement_type, "CREATE_EXTERNAL_TABLE");
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+        let warning = result
+            .issues
+            .iter()
+            .find(|issue| issue.code == issue_codes::UNSUPPORTED_SYNTAX)
+            .expect("unsupported-lineage warning");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.message, EXTERNAL_TABLE_UNSUPPORTED_LINEAGE_MESSAGE);
+        assert_eq!(
+            warning.source_name.as_deref(),
+            Some("object-id-external-table.sql")
+        );
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::PARSE_ERROR));
+    }
+
+    #[test]
+    fn rejects_unsupported_or_malformed_object_id_guard_shapes() {
+        let empty_arguments =
+            "IF OBJECT_ID() IS NULL CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)";
+        let error = parse_format(empty_arguments).expect_err("missing object name must fail");
+        assert_eq!(error.kind, ParseErrorKind::SyntaxError);
+
+        for sql in [
+            "IF OBJECT_ID(@object_name) IS NULL CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+            "IF OBJECT_ID('dbo.demo', 'U', 'extra') IS NULL CREATE EXTERNAL TABLE dbo.demo \
+             (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+            "IF OBJECT_ID('dbo.demo') CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+            "IF OBJECT_ID('dbo.demo') IS NOT NULL CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+            "IF OBJECT_ID('dbo.demo') IS NULL BEGIN CREATE EXTERNAL TABLE dbo.demo WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format) AS SELECT 1; END",
+            "IF OBJECT_ID('dbo.demo') IS NULL BEGIN CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format); SELECT 1; END",
+            "IF OBJECT_ID('dbo.demo') IS NULL BEGIN CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format); END ELSE SELECT 1",
+            "IF OBJECT_ID('dbo.demo') IS NULL CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format) ELSE SELECT 1",
+            "IF OBJECT_ID('outer') IS NULL BEGIN IF OBJECT_ID('inner') IS NULL CREATE EXTERNAL \
+             TABLE dbo.demo (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = source, \
+             FILE_FORMAT = format); END",
+        ] {
+            let error = parse_format(sql)
+                .expect_err("unsupported or malformed OBJECT_ID guard must be rejected");
+            assert_eq!(error.dialect, Some(Dialect::Mssql), "{sql}");
+        }
+
+        let not_null = parse_format(
+            "IF OBJECT_ID('dbo.demo') IS NOT NULL CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+        )
+        .expect_err("IS NOT NULL must be explicitly unsupported");
+        assert_eq!(not_null.kind, ParseErrorKind::UnsupportedFeature);
+
+        assert_eq!(
+            parse_format("IF 1 = 1 BEGIN PRINT 'CREATE EXTERNAL TABLE'; END")
+                .expect("general IF control should remain outside metadata parsing"),
+            None
+        );
+        assert_eq!(
+            parse_format(
+                "IF 1 = 1 BEGIN CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+                 (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format); END"
+            )
+            .expect("general IF controls should remain outside metadata parsing"),
+            None
+        );
+        assert_eq!(
+            parse_format("IF OBJECT_ID(N'dbo.synthetic_ext', N'U') IS NULL SELECT 1").expect(
+                "OBJECT_ID controls with a non-metadata body should remain outside parsing"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn object_id_guard_diagnostics_map_to_original_condition_and_body() {
+        let malformed_condition = concat!(
+            "/* café */ IF OBJECT_ID(1) IS NULL CREATE EXTERNAL TABLE dbo.demo (id INT) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)"
+        );
+        let error = parse_format(malformed_condition)
+            .expect_err("nonliteral OBJECT_ID argument must be rejected");
+        assert_eq!(error.dialect, Some(Dialect::Mssql));
+        let error_position = error.position.expect("OBJECT_ID argument position");
+        let error_offset = crate::analyzer::helpers::line_col_to_offset(
+            malformed_condition,
+            error_position.line,
+            error_position.column,
+        )
+        .expect("mapped OBJECT_ID argument offset");
+        assert!(
+            error_offset >= malformed_condition.find("(1)").expect("argument")
+                && error_offset < malformed_condition.find(" IS NULL").expect("null test"),
+            "condition diagnostics must point into the original OBJECT_ID argument"
+        );
+
+        let malformed_syntax = concat!(
+            "/* café */ IF OBJECT_ID('dbo.demo',) IS NULL ",
+            "CREATE EXTERNAL TABLE dbo.demo (id INT) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)"
+        );
+        let error = parse_format(malformed_syntax)
+            .expect_err("malformed OBJECT_ID argument syntax must fail");
+        let error_position = error.position.expect("malformed condition position");
+        let error_offset = crate::analyzer::helpers::line_col_to_offset(
+            malformed_syntax,
+            error_position.line,
+            error_position.column,
+        )
+        .expect("mapped malformed condition offset");
+        assert!(
+            error_offset >= malformed_syntax.find("OBJECT_ID").expect("condition")
+                && error_offset < malformed_syntax.find(" IS NULL").expect("null test"),
+            "parser errors from the wrapped condition must map to the original condition"
+        );
+
+        let malformed_body = concat!(
+            "/* café */ IF OBJECT_ID('dbo.demo') IS NULL BEGIN\r\n",
+            "CREATE EXTERNAL TABLE dbo.demo (id INT, label) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format);\r\n",
+            "END"
+        );
+        let error =
+            parse_format(malformed_body).expect_err("malformed guarded table columns must fail");
+        let error_position = error.position.expect("body error position");
+        let error_offset = crate::analyzer::helpers::line_col_to_offset(
+            malformed_body,
+            error_position.line,
+            error_position.column,
+        )
+        .expect("mapped guarded table column offset");
+        assert!(
+            error_offset >= malformed_body.find("label").expect("bad column")
+                && error_offset < malformed_body.find("WITH").expect("table options"),
+            "body diagnostics must point into the original guarded statement"
+        );
+    }
+
+    #[test]
+    fn guarded_external_table_analysis_reports_metadata_without_fabricating_lineage() {
+        let sql = concat!(
+            "/* café */ IF NOT EXISTS (SELECT 1 FROM sys.external_tables ",
+            "WHERE name = 'synthetic_demo') BEGIN\n",
+            "CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+            "FILE_FORMAT = synthetic_format);\n",
+            "END"
+        );
+        let request = crate::types::AnalyzeRequest {
+            sql: sql.to_string(),
+            files: None,
+            dialect: Dialect::Mssql,
+            source_name: Some("guarded-external-table.sql".to_string()),
+            options: None,
+            schema: None,
+            #[cfg(feature = "templating")]
+            template_config: None,
+        };
+
+        let result = super::super::analyze(&request);
+
+        assert_eq!(result.statements.len(), 1);
+        assert_eq!(result.statements[0].statement_type, "CREATE_EXTERNAL_TABLE");
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+        let warning = result
+            .issues
+            .iter()
+            .find(|issue| issue.code == issue_codes::UNSUPPORTED_SYNTAX)
+            .expect("unsupported-lineage warning");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.message, EXTERNAL_TABLE_UNSUPPORTED_LINEAGE_MESSAGE);
+        assert_eq!(
+            warning.source_name.as_deref(),
+            Some("guarded-external-table.sql")
+        );
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::PARSE_ERROR));
     }
 
     #[test]
@@ -1440,7 +2321,103 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_external_table_definitions_and_option_order() {
+    fn rejects_invalid_guarded_external_table_conditions_bodies_and_blocks() {
+        for sql in [
+            "IF EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+            "IF NOT EXISTS (SELECT FROM sys.external_tables WHERE name = 'demo') \
+             CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             CREATE EXTERNAL TABLE dbo.demo (id INT, label) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format)",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             BEGIN CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format);",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             BEGIN CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format); END \
+             ELSE SELECT 1",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format) ELSE SELECT 1",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'outer') \
+             BEGIN IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'inner') \
+             CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format); END",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             BEGIN CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format); \
+             SELECT 1; END",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             BEGIN CREATE EXTERNAL TABLE dbo.demo (id INT) WITH \
+             (LOCATION = 'demo/', DATA_SOURCE = source, FILE_FORMAT = format); END \
+             SELECT 1",
+            "IF NOT EXISTS (SELECT 1 FROM sys.external_tables WHERE name = 'demo') \
+             CREATE EXTERNAL TABLE dbo.demo WITH (LOCATION = 'demo/', \
+             DATA_SOURCE = source, FILE_FORMAT = format) AS SELECT 1",
+        ] {
+            assert!(
+                parse_format(sql).is_err(),
+                "invalid or unsupported guarded external-table syntax must be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_external_table_errors_keep_original_condition_and_body_positions() {
+        let malformed_body = concat!(
+            "/* café */ IF NOT EXISTS (\r\n",
+            "  SELECT 1 FROM sys.external_tables WHERE name = 'synthetic_demo'\r\n",
+            ") BEGIN\r\n",
+            "  CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT, label) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+            "FILE_FORMAT = synthetic_format);\r\n",
+            "END"
+        );
+        let error = parse_format(malformed_body).expect_err("malformed guarded columns must fail");
+        assert_eq!(error.dialect, Some(Dialect::Mssql));
+        let error_position = error.position.expect("body error position");
+        let error_offset = crate::analyzer::helpers::line_col_to_offset(
+            malformed_body,
+            error_position.line,
+            error_position.column,
+        )
+        .expect("mapped body error offset");
+        assert!(
+            error_offset >= malformed_body.find("label").expect("malformed column")
+                && error_offset < malformed_body.find("WITH").expect("table options"),
+            "column diagnostics must point into the original guarded body, not its adapted SQL"
+        );
+
+        let malformed_condition = concat!(
+            "/* café */ IF NOT EXISTS (\n",
+            "  SELECT FROM sys.external_tables WHERE name = 'synthetic_demo'\n",
+            ") CREATE EXTERNAL TABLE dbo.synthetic_demo (id INT) WITH ",
+            "(LOCATION = 'demo/', DATA_SOURCE = synthetic_store, ",
+            "FILE_FORMAT = synthetic_format)"
+        );
+        let error = parse_format(malformed_condition).expect_err("malformed guard query must fail");
+        assert_eq!(error.dialect, Some(Dialect::Mssql));
+        let error_position = error.position.expect("condition error position");
+        let error_offset = crate::analyzer::helpers::line_col_to_offset(
+            malformed_condition,
+            error_position.line,
+            error_position.column,
+        )
+        .expect("mapped condition error offset");
+        assert!(
+            error_offset
+                >= malformed_condition
+                    .find("SELECT FROM")
+                    .expect("invalid SELECT"),
+            "condition diagnostics must point to the original IF query"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_external_table_definitions() {
         let malformed_columns =
             "/* café */ CREATE EXTERNAL TABLE dbo.demo_table (id INT, label) WITH \
              (LOCATION = 'data/', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet)";
@@ -1459,14 +2436,28 @@ mod tests {
         );
 
         for sql in [
-            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
-             (DATA_SOURCE = demo_storage, LOCATION = 'data/', FILE_FORMAT = demo_parquet)",
             "CREATE EXTERNAL TABLE dbo.demo_table (id INT NOT NULL) WITH \
              (LOCATION = 'data/', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet)",
             "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
              (LOCATION = '', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet)",
             "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
-             (LOCATION = 'data/', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet, UNKNOWN = 1)",
+             (LOCATION = 'data/', LOCATION = 'other/', DATA_SOURCE = demo_storage, \
+             FILE_FORMAT = demo_parquet)",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
+             (DATA_SOURCE = demo_storage, DATA_SOURCE = other_store, LOCATION = 'data/', \
+             FILE_FORMAT = demo_parquet)",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
+             (DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet)",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
+             (LOCATION = 'data/', FILE_FORMAT = demo_parquet)",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
+             (DATA SOURCE = demo_storage, LOCATION = 'data/', FILE_FORMAT = demo_parquet)",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
+             (DATA_SOURCE = schema.demo_storage, LOCATION = 'data/', \
+             FILE_FORMAT = demo_parquet)",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
+             (LOCATION = 'data/', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet, \
+             UNKNOWN = 1)",
             "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH \
              (LOCATION = 'data/', DATA_SOURCE = demo_storage, FILE_FORMAT = demo_parquet) AS SELECT 1",
         ] {
@@ -1475,6 +2466,27 @@ mod tests {
                 "invalid external table syntax must remain an error: {sql}"
             );
         }
+
+        let duplicate_option = concat!(
+            "/* café */ IF OBJECT_ID(N'dbo.demo_table', N'U') IS NULL BEGIN\n",
+            "CREATE EXTERNAL TABLE dbo.demo_table (id INT) WITH ",
+            "(DATA_SOURCE = demo_storage, LOCATION = N'data/', LOCATION = N'other/', ",
+            "FILE_FORMAT = demo_parquet);\n",
+            "END"
+        );
+        let error = parse_format(duplicate_option).expect_err("duplicate option must fail");
+        let error_position = error.position.expect("duplicate option position");
+        let error_offset = crate::analyzer::helpers::line_col_to_offset(
+            duplicate_option,
+            error_position.line,
+            error_position.column,
+        )
+        .expect("mapped duplicate option offset");
+        assert_eq!(
+            error_offset,
+            duplicate_option.rfind("LOCATION").expect("second LOCATION"),
+            "guarded option errors must point to the original duplicate key"
+        );
     }
 
     #[test]
@@ -1509,6 +2521,13 @@ mod tests {
                 "malformed guarded DDL must remain an error: {sql}"
             );
         }
+
+        let invalid_if_exists = parse_format(
+            "IF EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = 'demo_format') \
+             CREATE EXTERNAL FILE FORMAT demo_format WITH (FORMAT_TYPE = PARQUET)",
+        )
+        .expect_err("file formats retain the IF NOT EXISTS guard requirement");
+        assert_eq!(invalid_if_exists.kind, ParseErrorKind::SyntaxError);
 
         let malformed_body = concat!(
             "/* café */ IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats ",

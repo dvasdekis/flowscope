@@ -6,15 +6,18 @@
 use super::external_metadata::{parse_external_metadata_statement, ExternalMetadataStatement};
 use crate::error::{ParseError, ParseErrorKind, Position};
 use crate::limits::{MAX_ANALYSIS_SOURCE_BYTES, MAX_ANALYSIS_TOTAL_BYTES};
-use crate::parser::{parse_sql_with_dialect_output, ParseSqlOutput};
+use crate::parser::{
+    parse_sql_with_dialect_output, parse_sql_with_dialect_tokens_output, ParseSqlOutput,
+};
 use crate::types::{issue_codes, AnalyzeRequest, Dialect, Issue, Span};
 use sqlparser::ast::{
-    Ident, Query, SetExpr, Statement, TableAliasColumnDef, TableFactor, TableWithJoins,
+    Ident, SetExpr, Statement, TableAliasColumnDef, TableFactor, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::MsSqlDialect;
-use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+use sqlparser::tokenizer::{Span as TokenSpan, Token, TokenWithSpan, Tokenizer};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::ops::Range;
 use std::rc::Rc;
 use thiserror::Error;
@@ -240,13 +243,18 @@ struct ParseContext<'a> {
 
 struct MssqlOpenRowsetSchema {
     openrowset_offset: usize,
-    replacement_range: Range<usize>,
+    token_range: Range<usize>,
     columns: Vec<TableAliasColumnDef>,
 }
 
 struct MssqlOpenRowsetCompatibility {
-    sql: String,
+    tokens: Vec<TokenWithSpan>,
     schemas: Vec<MssqlOpenRowsetSchema>,
+}
+
+struct MssqlSynapseOpenRowsetArgumentAdaptation {
+    bulk_index: usize,
+    equals_indices: Vec<usize>,
 }
 
 fn parse_input_sql_with_dialect_output(
@@ -275,7 +283,7 @@ fn parse_input_sql_with_dialect_output(
         return original;
     };
 
-    let mut output = match parse_sql_with_dialect_output(&compatibility.sql, dialect) {
+    let mut output = match parse_sql_with_dialect_tokens_output(dialect, compatibility.tokens) {
         Ok(output) => output,
         Err(error) => {
             return if original.is_ok() {
@@ -423,12 +431,10 @@ pub(crate) fn offset_to_position(sql: &str, offset: usize) -> Option<Position> {
     })
 }
 
-/// Rewrites only documented Synapse `OPENROWSET(BULK ..., OPTION = value, ...)`
-/// arguments to sqlparser's equivalent named-argument syntax. Each replacement
-/// preserves its byte length and line breaks so source offsets stay aligned.
+/// Returns the parser token stream for documented Synapse OPENROWSET arguments.
 #[cfg(test)]
-fn mssql_openrowset_compatible_sql(sql: &str) -> Option<String> {
-    mssql_openrowset_compatibility(sql).map(|compatibility| compatibility.sql)
+fn mssql_openrowset_compatible_tokens(sql: &str) -> Option<Vec<TokenWithSpan>> {
+    mssql_openrowset_compatibility(sql).map(|compatibility| compatibility.tokens)
 }
 
 fn mssql_parenthesized_bulk_syntax_error(sql: &str) -> Option<Position> {
@@ -477,8 +483,7 @@ fn mssql_parenthesized_bulk_syntax_error(sql: &str) -> Option<Position> {
             continue;
         }
 
-        let invalid_arguments = mssql_synapse_openrowset_argument_replacements(
-            sql,
+        let invalid_arguments = mssql_synapse_openrowset_argument_adaptation(
             &tokens,
             &argument_ranges,
             MSSQL_SYNAPSE_OPENROWSET_OPTIONS,
@@ -503,8 +508,7 @@ fn mssql_openrowset_compatibility(sql: &str) -> Option<MssqlOpenRowsetCompatibil
     let tokens = Tokenizer::new(&MsSqlDialect {}, sql)
         .tokenize_with_location()
         .ok()?;
-    let mut replacements = Vec::new();
-    let mut schema_replacements = Vec::new();
+    let mut adaptations = Vec::new();
     let mut schemas = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
@@ -531,8 +535,7 @@ fn mssql_openrowset_compatibility(sql: &str) -> Option<MssqlOpenRowsetCompatibil
         else {
             continue;
         };
-        let Some(argument_replacements) = mssql_synapse_openrowset_argument_replacements(
-            sql,
+        let Some(argument_adaptation) = mssql_synapse_openrowset_argument_adaptation(
             &tokens,
             &argument_ranges,
             MSSQL_SYNAPSE_OPENROWSET_OPTIONS,
@@ -550,44 +553,67 @@ fn mssql_openrowset_compatibility(sql: &str) -> Option<MssqlOpenRowsetCompatibil
             Ok(schema) => schema,
             Err(()) => continue,
         };
-        replacements.extend(argument_replacements);
+        adaptations.push(argument_adaptation);
         if let Some(schema) = schema {
-            schema_replacements.push(schema.replacement_range.clone());
             schemas.push(schema);
         }
     }
 
-    if replacements.is_empty() {
+    if adaptations.is_empty() {
         return None;
     }
 
-    replacements.sort_unstable();
-    replacements.dedup();
-    let mut compatible_bytes = sql.as_bytes().to_vec();
-    for range in schema_replacements {
-        if range.start > range.end
-            || range.end > compatible_bytes.len()
-            || !sql.is_char_boundary(range.start)
-            || !sql.is_char_boundary(range.end)
+    let mut removed = vec![false; tokens.len()];
+    for schema in &schemas {
+        for (index, token) in tokens
+            .iter()
+            .enumerate()
+            .take(schema.token_range.end)
+            .skip(schema.token_range.start)
         {
-            return None;
-        }
-        for byte in &mut compatible_bytes[range] {
-            if !matches!(*byte, b'\r' | b'\n') {
-                *byte = b' ';
+            if !matches!(token.token, Token::Whitespace(_)) {
+                removed[index] = true;
             }
         }
     }
-    let mut compatible_sql = String::from_utf8(compatible_bytes).ok()?;
-    for offset in replacements {
-        let byte = *compatible_sql.as_bytes().get(offset)?;
-        if byte != b'=' && !matches!(byte, b' ' | b'\t') {
-            return None;
+
+    let mut replacements = HashMap::new();
+    let mut insertions = Vec::with_capacity(adaptations.len());
+    for adaptation in adaptations {
+        let point_span = mssql_point_span(tokens[adaptation.bulk_index].span.end)?;
+        insertions.push((
+            adaptation.bulk_index + 1,
+            TokenWithSpan::new(Token::Colon, point_span),
+        ));
+        for index in adaptation.equals_indices {
+            if !matches!(tokens[index].token, Token::Eq) {
+                return None;
+            }
+            replacements.insert(index, TokenWithSpan::new(Token::Colon, tokens[index].span));
         }
-        compatible_sql.replace_range(offset..offset + 1, ":");
     }
-    (compatible_sql != sql).then_some(MssqlOpenRowsetCompatibility {
-        sql: compatible_sql,
+
+    insertions.sort_by_key(|(index, _)| *index);
+    let mut compatible_tokens = Vec::with_capacity(tokens.len() + insertions.len());
+    let mut insertion_index = 0;
+    for index in 0..=tokens.len() {
+        while insertions
+            .get(insertion_index)
+            .is_some_and(|(insertion_at, _)| *insertion_at == index)
+        {
+            compatible_tokens.push(insertions[insertion_index].1.clone());
+            insertion_index += 1;
+        }
+        if index < tokens.len() && !removed[index] {
+            compatible_tokens.push(
+                replacements
+                    .remove(&index)
+                    .unwrap_or_else(|| tokens[index].clone()),
+            );
+        }
+    }
+    Some(MssqlOpenRowsetCompatibility {
+        tokens: compatible_tokens,
         schemas,
     })
 }
@@ -615,14 +641,15 @@ fn mssql_openrowset_schema_after_call(
     let close_paren = mssql_matching_paren(tokens, open_paren).ok_or(())?;
     let column_ranges = mssql_openrowset_arguments(tokens, open_paren, close_paren).ok_or(())?;
     let columns = mssql_synapse_openrowset_schema_columns(sql, tokens, &column_ranges).ok_or(())?;
-    let with_range = mssql_token_byte_range(sql, &tokens[with_index]).ok_or(())?;
-    let close_range = mssql_token_byte_range(sql, &tokens[close_paren]).ok_or(())?;
-
     Ok(Some(MssqlOpenRowsetSchema {
         openrowset_offset,
-        replacement_range: with_range.start..close_range.end,
+        token_range: with_index..close_paren + 1,
         columns,
     }))
+}
+
+fn mssql_point_span(location: sqlparser::tokenizer::Location) -> Option<TokenSpan> {
+    (location.line != 0 && location.column != 0).then_some(TokenSpan::new(location, location))
 }
 
 fn mssql_synapse_openrowset_schema_columns(
@@ -719,126 +746,41 @@ fn mssql_apply_openrowset_schema_columns(
     statements: &mut [Statement],
     schemas: Vec<MssqlOpenRowsetSchema>,
 ) -> bool {
-    let mut schemas: HashMap<_, _> = schemas
+    let schemas: HashMap<_, _> = schemas
         .into_iter()
         .map(|schema| (schema.openrowset_offset, schema.columns))
         .collect();
+    let mut visitor = MssqlOpenRowsetSchemaVisitor { sql, schemas };
     for statement in statements {
-        if !mssql_apply_openrowset_schema_columns_to_statement(statement, sql, &mut schemas) {
+        if matches!(statement.visit(&mut visitor), ControlFlow::Break(())) {
             return false;
         }
     }
-    schemas.is_empty()
+    visitor.schemas.is_empty()
 }
 
-fn mssql_apply_openrowset_schema_columns_to_statement(
-    statement: &mut Statement,
-    sql: &str,
-    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
-) -> bool {
-    match statement {
-        Statement::Query(query) => {
-            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
-        }
-        Statement::Insert(insert) => insert.source.as_mut().is_none_or(|query| {
-            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
-        }),
-        Statement::CreateTable(create) => create.query.as_mut().is_none_or(|query| {
-            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
-        }),
-        Statement::CreateView(create) => {
-            mssql_apply_openrowset_schema_columns_to_query(&mut create.query, sql, schemas)
-        }
-        Statement::Update(update) => {
-            mssql_apply_openrowset_schema_columns_to_table_with_joins(
-                &mut update.table,
-                sql,
-                schemas,
-            ) && update.from.as_mut().is_none_or(|from| {
-                let tables = match from {
-                    sqlparser::ast::UpdateTableFromKind::BeforeSet(tables)
-                    | sqlparser::ast::UpdateTableFromKind::AfterSet(tables) => tables,
-                };
-                tables.iter_mut().all(|table| {
-                    mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
-                })
-            })
-        }
-        Statement::Delete(delete) => {
-            let from_tables = match &mut delete.from {
-                sqlparser::ast::FromTable::WithFromKeyword(tables)
-                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-            };
-            from_tables.iter_mut().all(|table| {
-                mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
-            }) && delete.using.as_mut().is_none_or(|tables| {
-                tables.iter_mut().all(|table| {
-                    mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
-                })
-            })
-        }
-        Statement::Merge(merge) => {
-            mssql_apply_openrowset_schema_columns_to_table_factor(&mut merge.table, sql, schemas)
-                && mssql_apply_openrowset_schema_columns_to_table_factor(
-                    &mut merge.source,
-                    sql,
-                    schemas,
-                )
-        }
-        _ => true,
-    }
+struct MssqlOpenRowsetSchemaVisitor<'a> {
+    sql: &'a str,
+    schemas: HashMap<usize, Vec<TableAliasColumnDef>>,
 }
 
-fn mssql_apply_openrowset_schema_columns_to_query(
-    query: &mut Query,
-    sql: &str,
-    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
-) -> bool {
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
-            if !mssql_apply_openrowset_schema_columns_to_query(&mut cte.query, sql, schemas) {
-                return false;
-            }
+impl VisitorMut for MssqlOpenRowsetSchemaVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &mut TableFactor,
+    ) -> ControlFlow<Self::Break> {
+        if mssql_apply_openrowset_schema_columns_to_table_factor(
+            table_factor,
+            self.sql,
+            &mut self.schemas,
+        ) {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
         }
     }
-    mssql_apply_openrowset_schema_columns_to_set_expr(&mut query.body, sql, schemas)
-}
-
-fn mssql_apply_openrowset_schema_columns_to_set_expr(
-    set_expr: &mut SetExpr,
-    sql: &str,
-    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
-) -> bool {
-    match set_expr {
-        SetExpr::Select(select) => select.from.iter_mut().all(|table| {
-            mssql_apply_openrowset_schema_columns_to_table_with_joins(table, sql, schemas)
-        }),
-        SetExpr::Query(query) => {
-            mssql_apply_openrowset_schema_columns_to_query(query, sql, schemas)
-        }
-        SetExpr::SetOperation { left, right, .. } => {
-            mssql_apply_openrowset_schema_columns_to_set_expr(left, sql, schemas)
-                && mssql_apply_openrowset_schema_columns_to_set_expr(right, sql, schemas)
-        }
-        SetExpr::Insert(statement)
-        | SetExpr::Update(statement)
-        | SetExpr::Delete(statement)
-        | SetExpr::Merge(statement) => {
-            mssql_apply_openrowset_schema_columns_to_statement(statement, sql, schemas)
-        }
-        _ => true,
-    }
-}
-
-fn mssql_apply_openrowset_schema_columns_to_table_with_joins(
-    table: &mut TableWithJoins,
-    sql: &str,
-    schemas: &mut HashMap<usize, Vec<TableAliasColumnDef>>,
-) -> bool {
-    mssql_apply_openrowset_schema_columns_to_table_factor(&mut table.relation, sql, schemas)
-        && table.joins.iter_mut().all(|join| {
-            mssql_apply_openrowset_schema_columns_to_table_factor(&mut join.relation, sql, schemas)
-        })
 }
 
 fn mssql_apply_openrowset_schema_columns_to_table_factor(
@@ -879,19 +821,6 @@ fn mssql_apply_openrowset_schema_columns_to_table_factor(
                 alias_column.data_type = schema_column.data_type;
             }
             true
-        }
-        TableFactor::Derived { subquery, .. } => {
-            mssql_apply_openrowset_schema_columns_to_query(subquery, sql, schemas)
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => mssql_apply_openrowset_schema_columns_to_table_with_joins(
-            table_with_joins,
-            sql,
-            schemas,
-        ),
-        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
-            mssql_apply_openrowset_schema_columns_to_table_factor(table, sql, schemas)
         }
         _ => true,
     }
@@ -1021,12 +950,11 @@ fn mssql_openrowset_arguments(
     (!arguments.iter().any(Range::is_empty)).then_some(arguments)
 }
 
-fn mssql_synapse_openrowset_argument_replacements(
-    sql: &str,
+fn mssql_synapse_openrowset_argument_adaptation(
     tokens: &[TokenWithSpan],
     argument_ranges: &[Range<usize>],
     options: &[&str],
-) -> Option<Vec<usize>> {
+) -> Option<MssqlSynapseOpenRowsetArgumentAdaptation> {
     let mut significant = mssql_significant_token_indices(tokens, argument_ranges.first()?);
     let bulk_index = *significant.first()?;
     let Token::Word(bulk) = &tokens[bulk_index].token else {
@@ -1061,13 +989,7 @@ fn mssql_synapse_openrowset_argument_replacements(
         return None;
     }
 
-    let bulk_range = mssql_token_byte_range(sql, &tokens[bulk_index])?;
-    let path_start = mssql_token_byte_range(sql, &tokens[path_index])?.start;
-    let separator = sql.get(bulk_range.end..path_start)?;
-    let bulk_separator = separator
-        .char_indices()
-        .find_map(|(index, ch)| matches!(ch, ' ' | '\t').then_some(bulk_range.end + index))?;
-    let mut replacements = vec![bulk_separator];
+    let mut equals_indices = Vec::new();
     let mut seen_options = std::collections::HashSet::new();
     let mut seen_format = false;
 
@@ -1096,14 +1018,13 @@ fn mssql_synapse_openrowset_argument_replacements(
         } else if option != "DATA_SOURCE" && !seen_format {
             return None;
         }
-        let equals_range = mssql_token_byte_range(sql, &tokens[equals_index])?;
-        if sql.get(equals_range.clone())? != "=" {
-            return None;
-        }
-        replacements.push(equals_range.start);
+        equals_indices.push(equals_index);
     }
 
-    seen_format.then_some(replacements)
+    seen_format.then_some(MssqlSynapseOpenRowsetArgumentAdaptation {
+        bulk_index,
+        equals_indices,
+    })
 }
 
 fn mssql_synapse_bulk_path_is_string(token: &Token) -> bool {
@@ -2756,6 +2677,55 @@ mod tests {
         }
     }
 
+    fn openrowset_schema_types(statement: &Statement) -> Vec<Vec<(String, Option<String>)>> {
+        #[derive(Default)]
+        struct SchemaCollector {
+            schemas: Vec<Vec<(String, Option<String>)>>,
+        }
+
+        impl VisitorMut for SchemaCollector {
+            type Break = ();
+
+            fn pre_visit_table_factor(
+                &mut self,
+                table_factor: &mut TableFactor,
+            ) -> ControlFlow<Self::Break> {
+                if let TableFactor::Table {
+                    name,
+                    alias: Some(alias),
+                    ..
+                } = table_factor
+                {
+                    if name
+                        .0
+                        .first()
+                        .and_then(|part| part.as_ident())
+                        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("OPENROWSET"))
+                    {
+                        self.schemas.push(
+                            alias
+                                .columns
+                                .iter()
+                                .map(|column| {
+                                    (
+                                        column.name.value.clone(),
+                                        column.data_type.as_ref().map(ToString::to_string),
+                                    )
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+
+        let mut statement = statement.clone();
+        let mut collector = SchemaCollector::default();
+        let _ = statement.visit(&mut collector);
+        collector.schemas
+    }
+
     #[test]
     fn mssql_synapse_openrowset_parsing_preserves_ast_and_source_offsets() {
         let sql = concat!(
@@ -2770,24 +2740,8 @@ mod tests {
             "the upstream MSSQL parser currently rejects Synapse's OPENROWSET option syntax"
         );
 
-        let compatible_sql =
-            mssql_openrowset_compatible_sql(sql).expect("recognized Synapse OPENROWSET syntax");
-        assert_eq!(compatible_sql.len(), sql.len());
-        assert_eq!(
-            compatible_sql.matches('\n').count(),
-            sql.matches('\n').count()
-        );
-        assert_eq!(
-            compatible_sql.matches('\r').count(),
-            sql.matches('\r').count()
-        );
-        let path = "'https://storage.example/container/*.parquet'";
-        let path_start = sql.find(path).expect("path literal");
-        assert_eq!(
-            &compatible_sql[path_start..path_start + path.len()],
-            path,
-            "one-byte rewrites must leave every source token at the same byte offset"
-        );
+        let _compatible_tokens =
+            mssql_openrowset_compatible_tokens(sql).expect("recognized Synapse OPENROWSET syntax");
 
         let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
             .expect("parse with bounded Synapse syntax adaptation");
@@ -2849,18 +2803,8 @@ mod tests {
             "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', ",
             "DATA_SOURCE = 'lake') AS r"
         );
-        let compatible_sql =
-            mssql_openrowset_compatible_sql(sql).expect("recognized Synapse option ordering");
-        assert_eq!(compatible_sql.len(), sql.len());
-        assert_eq!(
-            compatible_sql.matches('\n').count(),
-            sql.matches('\n').count()
-        );
-        assert_eq!(
-            compatible_sql.find("DATA_SOURCE"),
-            sql.find("DATA_SOURCE"),
-            "one-byte rewrites must preserve original source offsets"
-        );
+        let _compatible_tokens =
+            mssql_openrowset_compatible_tokens(sql).expect("recognized Synapse option ordering");
 
         let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
             .expect("parse FORMAT-before-DATA_SOURCE Synapse syntax");
@@ -2922,7 +2866,7 @@ mod tests {
             "SELECT r.id FROM OPENROWSET(BULK 'data.parquet', FORMAT = 'PARQUET', DATA_SOURCE = 'lake', UNKNOWN = 'x') AS r",
         ] {
             assert!(
-                mssql_openrowset_compatible_sql(malformed).is_none(),
+                mssql_openrowset_compatible_tokens(malformed).is_none(),
                 "malformed options must not use the compatibility adapter: {malformed}"
             );
             assert!(
@@ -2954,13 +2898,8 @@ mod tests {
             "  ROWSET_OPTIONS = '{\"READ_OPTIONS\":[\"ALLOW_INCONSISTENT_READS\"]}'\r\n",
             ") AS records"
         );
-        let compatible_sql =
-            mssql_openrowset_compatible_sql(sql).expect("recognized Synapse CSV options");
-        assert_eq!(compatible_sql.len(), sql.len());
-        assert_eq!(
-            compatible_sql.matches('\n').count(),
-            sql.matches('\n').count()
-        );
+        let _compatible_tokens =
+            mssql_openrowset_compatible_tokens(sql).expect("recognized Synapse CSV options");
 
         let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
             .expect("parse CSV rowset options");
@@ -3004,7 +2943,7 @@ mod tests {
 
         let malformed =
             "SELECT r.id FROM OPENROWSET(BULK 'data.csv', FORMAT = 'CSV', ROWSET_OPTIONS = TRUE) AS r";
-        assert!(mssql_openrowset_compatible_sql(malformed).is_none());
+        assert!(mssql_openrowset_compatible_tokens(malformed).is_none());
         let error = parse_input_sql_with_dialect_output(malformed, Dialect::Mssql)
             .err()
             .expect("non-string ROWSET_OPTIONS must remain invalid");
@@ -3028,9 +2967,8 @@ mod tests {
             ") WITH (item_id BIGINT 1) AS delta_row ",
             "ON csv_row.item_id = delta_row.item_id"
         );
-        let compatible_sql =
-            mssql_openrowset_compatible_sql(sql).expect("adapt both external rowsets");
-        assert_eq!(compatible_sql.len(), sql.len());
+        let _compatible_tokens =
+            mssql_openrowset_compatible_tokens(sql).expect("adapt both external rowsets");
 
         let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
             .expect("parse multiple CSV and Delta rowsets");
@@ -3170,25 +3108,8 @@ mod tests {
             "the upstream parser accepts this shape as a BULK function call rather than a Synapse argument"
         );
 
-        let compatible_sql =
-            mssql_openrowset_compatible_sql(sql).expect("recognize a Synapse BULK file list");
-        assert_eq!(compatible_sql.len(), sql.len());
-        assert_eq!(
-            compatible_sql.matches('\n').count(),
-            sql.matches('\n').count()
-        );
-        assert_eq!(
-            compatible_sql.matches('\r').count(),
-            sql.matches('\r').count()
-        );
-        for path in ["N'data/a.parquet'", "'data/b.parquet'"] {
-            let path_start = sql.find(path).expect("path literal");
-            assert_eq!(
-                &compatible_sql[path_start..path_start + path.len()],
-                path,
-                "one-byte rewrites must keep file-list tokens at their original offsets"
-            );
-        }
+        let _compatible_tokens =
+            mssql_openrowset_compatible_tokens(sql).expect("recognize a Synapse BULK file list");
 
         let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
             .expect("parse parenthesized Synapse BULK file list");
@@ -3237,6 +3158,139 @@ mod tests {
     }
 
     #[test]
+    fn mssql_openrowset_bulk_lists_accept_newline_adjacent_and_comment_separators() {
+        let sql = concat!(
+            "-- café\r\n",
+            "SELECT a.id, b.id, c.id, d.id, e.id, f.id FROM OPENROWSET(",
+            "BULK\n('demo/a.parquet', 'demo/b.parquet'), FORMAT='PARQUET'",
+            ") WITH (id BIGINT) AS a ",
+            "JOIN OPENROWSET(BULK('demo/c.parquet', 'demo/d.parquet'), ",
+            "FORMAT = 'PARQUET') WITH (id INT) AS b ON a.id = b.id ",
+            "JOIN OPENROWSET(BULK/* λ */\r\n('demo/e.parquet', 'demo/f.parquet'), ",
+            "FORMAT='PARQUET') WITH (id SMALLINT) AS c ON b.id = c.id ",
+            "JOIN OPENROWSET(BULK/*comment only*/('demo/g.parquet', 'demo/h.parquet'), ",
+            "FORMAT='PARQUET') WITH (id TINYINT) AS d ON c.id = d.id ",
+            "JOIN OPENROWSET(BULK'demo/i.parquet', FORMAT='PARQUET') ",
+            "WITH (id INTEGER) AS e ON d.id = e.id ",
+            "JOIN OPENROWSET(BULK\n'demo/j.parquet', FORMAT='PARQUET') ",
+            "WITH (id DECIMAL(10, 2)) AS f ON e.id = f.id"
+        );
+        let compatible_tokens = mssql_openrowset_compatible_tokens(sql)
+            .expect("recognize newline, adjacent, and comment-separated BULK lists");
+        let original_tokens = Tokenizer::new(&MsSqlDialect {}, sql)
+            .tokenize_with_location()
+            .expect("tokenize original source");
+        let bulk_token = original_tokens
+            .iter()
+            .find(|token| matches!(&token.token, Token::Word(word) if word.value.eq_ignore_ascii_case("BULK")))
+            .expect("original BULK token");
+        let inserted_colon = compatible_tokens
+            .iter()
+            .find(|token| {
+                matches!(token.token, Token::Colon)
+                    && token.span.start == bulk_token.span.end
+                    && token.span.end == bulk_token.span.end
+            })
+            .expect("zero-width named-argument punctuation at the original token boundary");
+        assert_eq!(inserted_colon.span.start, bulk_token.span.end);
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse all documented file-list separator forms");
+        assert!(output.parser_fallback_used);
+        assert_eq!(output.statements.len(), 1);
+        assert_eq!(
+            openrowset_schema_types(&output.statements[0]),
+            vec![
+                vec![("id".to_string(), Some("BIGINT".to_string()))],
+                vec![("id".to_string(), Some("INT".to_string()))],
+                vec![("id".to_string(), Some("SMALLINT".to_string()))],
+                vec![("id".to_string(), Some("TINYINT".to_string()))],
+                vec![("id".to_string(), Some("INTEGER".to_string()))],
+                vec![("id".to_string(), Some("DECIMAL(10,2)".to_string()))],
+            ]
+        );
+
+        let ranges = compute_statement_ranges_for_dialect(sql, Dialect::Mssql)
+            .expect("compute ranges against unchanged source");
+        assert_eq!(ranges, vec![sql.find("SELECT").unwrap()..sql.len()]);
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(
+            analysis.statements[0].span,
+            Some(Span::new(sql.find("SELECT").unwrap(), sql.len())),
+            "synthetic punctuation must not shift UTF-8 source spans"
+        );
+        assert!(
+            !analysis.issues.iter().any(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            }),
+            "all separator forms should analyze without parser errors: {:?}",
+            analysis.issues
+        );
+
+        let generic = parse_input_sql_with_dialect_output(sql, Dialect::Generic);
+        assert_eq!(
+            parse_sql_with_dialect_output(sql, Dialect::Generic).is_ok(),
+            generic.is_ok(),
+            "OPENROWSET token adaptation must remain MSSQL-only"
+        );
+        if let Ok(output) = generic {
+            assert!(!output.parser_fallback_used);
+        }
+    }
+
+    #[test]
+    fn mssql_openrowset_fallback_composes_with_trailing_comma_before_from_sanitizer() {
+        let sql = concat!(
+            "SELECT src.id,\n",
+            "FROM OPENROWSET(BULK\n",
+            "('demo/a.parquet', 'demo/b.parquet'), FORMAT = 'PARQUET') ",
+            "WITH (id BIGINT) AS src"
+        );
+        assert!(
+            parse_sql_with_dialect_output(sql, Dialect::Mssql).is_err(),
+            "the primary parser cannot consume this combined compatibility shape"
+        );
+
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("compose the source-preserving token fallbacks");
+        assert!(output.parser_fallback_used);
+        let [Statement::Query(query)] = output.statements.as_slice() else {
+            panic!("expected one SELECT query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT body");
+        };
+        assert_eq!(select.projection.len(), 1, "the trailing comma is removed");
+        assert_eq!(
+            openrowset_schema_types(&output.statements[0]),
+            vec![vec![("id".to_string(), Some("BIGINT".to_string()))]]
+        );
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(
+            analysis.statements[0].span,
+            Some(Span::new(sql.find("SELECT").unwrap(), sql.len())),
+            "token fallback composition must retain original statement offsets"
+        );
+        assert!(
+            !analysis.issues.iter().any(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            }),
+            "the combined fallback should not emit a parse error: {:?}",
+            analysis.issues
+        );
+    }
+
+    #[test]
     fn mssql_synapse_openrowset_schema_is_preserved_as_alias_columns() {
         let sql = concat!(
             "-- café\r\n",
@@ -3249,17 +3303,8 @@ mod tests {
             "  [customer_name] VARCHAR(128) '$.customerName'\n",
             ") AS [src]"
         );
-        let compatible_sql =
-            mssql_openrowset_compatible_sql(sql).expect("recognized schema-bearing OPENROWSET");
-        assert_eq!(compatible_sql.len(), sql.len());
-        assert_eq!(
-            compatible_sql.matches('\n').count(),
-            sql.matches('\n').count()
-        );
-        assert_eq!(
-            compatible_sql.matches('\r').count(),
-            sql.matches('\r').count()
-        );
+        let _compatible_tokens =
+            mssql_openrowset_compatible_tokens(sql).expect("recognized schema-bearing OPENROWSET");
 
         let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
             .expect("parse schema-bearing Synapse OPENROWSET");
@@ -3304,10 +3349,117 @@ mod tests {
     }
 
     #[test]
+    fn mssql_openrowset_schema_attaches_inside_nested_procedure_blocks() {
+        let sql = concat!(
+            "CREATE OR ALTER PROCEDURE dbo.demo AS BEGIN\n",
+            "  IF 1 = 1 BEGIN\n",
+            "    SELECT r.id FROM OPENROWSET(BULK 'demo/procedure.parquet', ",
+            "FORMAT = 'PARQUET') WITH (id INT) AS r;\n",
+            "  END;\n",
+            "END"
+        );
+        let output = parse_input_sql_with_dialect_output(sql, Dialect::Mssql)
+            .expect("parse schema-bearing OPENROWSET within nested procedure blocks");
+        assert!(output.parser_fallback_used);
+        let Statement::CreateProcedure { body, .. } = &output.statements[0] else {
+            panic!("expected CREATE PROCEDURE");
+        };
+        let [Statement::If(if_statement)] = body.statements().as_slice() else {
+            panic!("expected nested IF block in procedure body");
+        };
+        assert!(matches!(
+            if_statement.if_block.statements().as_slice(),
+            [Statement::Query(_)]
+        ));
+        assert_eq!(
+            openrowset_schema_types(&output.statements[0]),
+            vec![vec![("id".to_string(), Some("INT".to_string()))]]
+        );
+
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = sql.to_owned();
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(analysis.statements.len(), 1);
+        assert_eq!(
+            analysis.statements[0].span,
+            Some(Span::new(0, sql.len())),
+            "nested procedure blocks must keep original source offsets"
+        );
+        assert!(
+            !analysis.issues.iter().any(|issue| {
+                issue.code == issue_codes::PARSE_ERROR
+                    && issue.severity == crate::types::Severity::Error
+            }),
+            "schema attachment inside nested blocks must not fail analysis: {:?}",
+            analysis.issues
+        );
+    }
+
+    #[test]
+    fn mssql_openrowset_schema_attaches_in_cte_tvfs_and_trigger_blocks() {
+        let function_sql = concat!(
+            "CREATE OR ALTER FUNCTION dbo.demo_rows() RETURNS TABLE AS RETURN ",
+            "WITH source_rows AS (SELECT f.id FROM OPENROWSET(",
+            "BULK 'demo/function.parquet', FORMAT='PARQUET') ",
+            "WITH (id SMALLINT) AS f) SELECT id FROM source_rows"
+        );
+        let function_output = parse_input_sql_with_dialect_output(function_sql, Dialect::Mssql)
+            .expect("parse CTE-backed table-valued function");
+        assert!(matches!(
+            function_output.statements.as_slice(),
+            [Statement::CreateFunction(_)]
+        ));
+        assert_eq!(
+            openrowset_schema_types(&function_output.statements[0]),
+            vec![vec![("id".to_string(), Some("SMALLINT".to_string()))]]
+        );
+
+        let trigger_sql = concat!(
+            "CREATE TRIGGER dbo.demo_trigger ON dbo.source AFTER INSERT AS BEGIN\n",
+            "  SELECT t.id FROM OPENROWSET(BULK 'demo/trigger.parquet', ",
+            "FORMAT='PARQUET') WITH (id BIGINT) AS t;\n",
+            "END"
+        );
+        let trigger_output = parse_input_sql_with_dialect_output(trigger_sql, Dialect::Mssql)
+            .expect("parse schema-bearing OPENROWSET within a trigger block");
+        assert!(matches!(
+            trigger_output.statements.as_slice(),
+            [Statement::CreateTrigger(_)]
+        ));
+        assert_eq!(
+            openrowset_schema_types(&trigger_output.statements[0]),
+            vec![vec![("id".to_string(), Some("BIGINT".to_string()))]]
+        );
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.sql = trigger_sql.to_owned();
+        let analysis = crate::analyzer::analyze(&request);
+        assert_eq!(
+            analysis.statements[0].span,
+            Some(Span::new(0, trigger_sql.len())),
+            "trigger statements must retain original source offsets"
+        );
+    }
+
+    #[test]
+    fn mssql_openrowset_malformed_schema_inside_procedure_remains_a_parse_error() {
+        let malformed = concat!(
+            "CREATE PROCEDURE dbo.demo AS BEGIN ",
+            "SELECT r.id FROM OPENROWSET(BULK 'demo/data.parquet', ",
+            "FORMAT='PARQUET') WITH (id) AS r; END"
+        );
+        assert!(
+            parse_input_sql_with_dialect_output(malformed, Dialect::Mssql).is_err(),
+            "malformed schema declarations in procedural containers must remain errors"
+        );
+    }
+
+    #[test]
     fn mssql_openrowset_adapter_does_not_accept_unrecognized_or_malformed_forms() {
         let unknown_option = "SELECT * FROM OPENROWSET(BULK 'path', UNKNOWN_OPTION = 'x') AS file";
         assert!(
-            mssql_openrowset_compatible_sql(unknown_option).is_none(),
+            mssql_openrowset_compatible_tokens(unknown_option).is_none(),
             "unknown options must not be rewritten into parser-supported arguments"
         );
 
@@ -3325,8 +3477,11 @@ mod tests {
             "SELECT * FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT,) AS file",
             "SELECT * FROM OPENROWSET(BULK (), FORMAT = 'PARQUET') AS file",
             "SELECT * FROM OPENROWSET(BULK ('path',), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK('path',), FORMAT = 'PARQUET') AS file",
             "SELECT * FROM OPENROWSET(BULK (, 'path'), FORMAT = 'PARQUET') AS file",
             "SELECT * FROM OPENROWSET(BULK ('path' 'other'), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK/*only*/('path', 1), FORMAT = 'PARQUET') AS file",
+            "SELECT * FROM OPENROWSET(BULK\n('path', 1), FORMAT = 'PARQUET') AS file",
             "SELECT * FROM OPENROWSET(BULK (('path'), 'other'), FORMAT = 'PARQUET') AS file",
             "SELECT * FROM OPENROWSET(BULK ('path', 1), FORMAT = 'PARQUET') AS file",
             "SELECT * FROM OPENROWSET(BULK ('path', 'other',), FORMAT = 'PARQUET') AS file",
@@ -3336,7 +3491,7 @@ mod tests {
                 "unsupported or malformed syntax must remain a parser error: {sql}"
             );
             assert!(
-                mssql_openrowset_compatible_sql(sql).is_none(),
+                mssql_openrowset_compatible_tokens(sql).is_none(),
                 "malformed schema syntax must not be rewritten: {sql}"
             );
         }
@@ -3344,7 +3499,7 @@ mod tests {
         let non_target_parse_error =
             "SELECT FROM OPENROWSET(BULK 'path', FORMAT = 'PARQUET') AS file";
         assert!(
-            mssql_openrowset_compatible_sql(non_target_parse_error).is_some(),
+            mssql_openrowset_compatible_tokens(non_target_parse_error).is_some(),
             "the documented OPENROWSET arguments should still be recognized"
         );
         assert!(
@@ -3352,7 +3507,7 @@ mod tests {
             "rewriting OPENROWSET must not hide unrelated SQL parse errors"
         );
         let parse_error_without_openrowset = "SELECT FROM dbo.source";
-        assert!(mssql_openrowset_compatible_sql(parse_error_without_openrowset).is_none());
+        assert!(mssql_openrowset_compatible_tokens(parse_error_without_openrowset).is_none());
         assert!(
             parse_input_sql_with_dialect_output(parse_error_without_openrowset, Dialect::Mssql)
                 .is_err(),
@@ -3363,7 +3518,7 @@ mod tests {
             "SELECT 'OPENROWSET(BULK ''path'', FORMAT = ''CSV'') WITH (id INT)' AS sql_text ",
             "/* OPENROWSET(BULK 'path', FORMAT = 'CSV') WITH (id INT) */"
         );
-        assert!(mssql_openrowset_compatible_sql(embedded_keyword_sql).is_none());
+        assert!(mssql_openrowset_compatible_tokens(embedded_keyword_sql).is_none());
         let embedded_keyword_output =
             parse_input_sql_with_dialect_output(embedded_keyword_sql, Dialect::Mssql)
                 .expect("keywords in strings/comments must remain ordinary SQL text");
@@ -3375,7 +3530,7 @@ mod tests {
             "'SELECT id FROM dbo.source'",
             ") AS rowset"
         );
-        assert!(mssql_openrowset_compatible_sql(provider_sql).is_none());
+        assert!(mssql_openrowset_compatible_tokens(provider_sql).is_none());
         let provider_parse = parse_sql_with_dialect_output(provider_sql, Dialect::Mssql);
         let provider_adaptation = parse_input_sql_with_dialect_output(provider_sql, Dialect::Mssql);
         assert_eq!(provider_parse.is_ok(), provider_adaptation.is_ok());

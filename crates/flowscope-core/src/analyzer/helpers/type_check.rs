@@ -88,6 +88,15 @@ fn check_expr_types_inner(
         Expr::Cast { expr: inner, .. } => {
             check_expr_types_inner(inner, statement_index, dialect, issues, next_depth);
         }
+        Expr::Collate { expr: inner, .. } => {
+            check_expr_types_inner(inner, statement_index, dialect, issues, next_depth);
+        }
+        Expr::TryParse { expr, culture, .. } => {
+            check_expr_types_inner(expr, statement_index, dialect, issues, next_depth);
+            if let Some(culture) = culture {
+                check_expr_types_inner(culture, statement_index, dialect, issues, next_depth);
+            }
+        }
         Expr::Case {
             operand,
             conditions,

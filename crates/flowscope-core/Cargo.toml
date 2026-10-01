@@ -19,7 +19,7 @@ templating = ["dep:minijinja"]
 tracing = ["dep:tracing"]
 
 [dependencies]
-sqlparser.workspace = true
+sqlparser = { workspace = true, features = ["visitor"] }
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

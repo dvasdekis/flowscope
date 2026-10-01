@@ -11,13 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added synthetic regressions for MSSQL `CREATE OR ALTER VIEW`, multiple Synapse `OPENROWSET` sources, `DELTA` format, and CSV `ROWSET_OPTIONS`.
 - Added narrow Synapse CETAS parsing for optional name-only output-column lists, `LOCATION`, `DATA_SOURCE`, and `FILE_FORMAT` followed by one `SELECT`; typed column definitions remain unsupported, and analysis emits an explicit unsupported-lineage warning without creating table or file-write lineage.
-- Added metadata-only parsing for typed Synapse `CREATE EXTERNAL TABLE ... WITH (LOCATION, DATA_SOURCE, FILE_FORMAT)` without `AS SELECT`, plus bounded `IF NOT EXISTS (SELECT ...)` guards whose single `CREATE EXTERNAL FILE FORMAT` body is bare or wrapped in `BEGIN`/`END`. Both forms validate the condition and body rather than skipping control flow; unsupported `ELSE` branches remain errors.
+- Added metadata-only parsing for typed Synapse external tables, plus bounded `IF NOT EXISTS (SELECT ...)` and literal-only `IF OBJECT_ID(...) IS NULL` guards whose single external file-format or typed external-table body is bare or wrapped in `BEGIN`/`END`. Conditions and bodies are validated; nested guards, guarded CETAS, extra statements, and unsupported `ELSE` branches remain errors.
+- Accepted either `LOCATION`/`DATA_SOURCE` order before `FILE_FORMAT` in standard typed external tables, including the owner-confirmed Serverless SQL pool order; CETAS ordering remains unchanged.
 - Accepted and regression-tested Synapse `OPENROWSET` with optional `DATA_SOURCE` either before or after required `FORMAT`, including the owner-confirmed Serverless SQL pool order; duplicate, malformed, and unknown options remain rejected.
+- Added faithful MSSQL `TRY_PARSE(input AS type [USING culture])` parsing, preserving type and culture in a dedicated AST node. The publishable `flowscope-sqlparser` fork retains the upstream 0.61.0 baseline.
 
 ### Fixed
 
 - Accepted MSSQL inline table-valued function `RETURN WITH ... SELECT ...` bodies without outer parentheses, including EOF without a final semicolon, while preserving source spans and rejecting malformed returns.
-- Used the T-SQL reserved-keyword policy for MSSQL identifier fallback, allowing nonreserved special-expression spellings such as `TRIM` as column references without changing other dialects or accepting malformed expressions.
+- Used the T-SQL reserved-keyword policy for MSSQL identifiers, preserving nonreserved spellings such as `TRIM` and `INTERVAL` as column references in projections, arithmetic, aliases, predicates, and `TRY_PARSE` arguments without changing other dialects or masking malformed expressions.
+- Removed the OPENROWSET adapter's horizontal-whitespace requirement through token-level adaptation, preserving original spans for newline, adjacent-parenthesis, and comments-only `BULK` boundaries.
+- Reattached declared OPENROWSET schemas inside procedures, functions, triggers, CTEs, and nested blocks.
+- Accepted bounded optional statement terminators inside MSSQL modules and standalone `BEGIN` blocks without masking malformed fragments, crossing GO batches, or rewriting transaction blocks.
+- Parsed qualified-column `COLLATE` with correct MSSQL expression precedence and preserved its input references in lineage and lint traversal.
 - Added MSSQL-only parsing support for documented Synapse `OPENROWSET(BULK ('path1', 'path2'), ...)` file lists, with malformed lists rejected and original source offsets preserved.
 - Accepted declared-column `COLLATE` on Synapse `OPENROWSET` while preserving the parsed data type and source offsets.
 - Split supported semicolon-optional MSSQL statements—including `EXEC`/`DROP VIEW`, `BEGIN`/`SET`, and `WHILE`/`SET` batches—at validated top-level newline boundaries without changing other dialects or recovering malformed fragments as valid statements.

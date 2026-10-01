@@ -4,6 +4,7 @@ members = [
     "crates/flowscope-wasm",
     "crates/flowscope-cli",
     "crates/flowscope-export",
+    "vendor/sqlparser",
 ]
 resolver = "2"
 
@@ -17,7 +18,8 @@ repository = "https://github.com/pondpilot/flowscope"
 [workspace.dependencies]
 flowscope-core = { version = "0.9.5", path = "crates/flowscope-core", default-features = false }
 flowscope-export = { version = "0.9.5", path = "crates/flowscope-export", default-features = false }
-sqlparser = "0.61"
+# FlowScope's publishable fork of upstream sqlparser 0.61.0.
+sqlparser = { package = "flowscope-sqlparser", version = "0.9.5", path = "vendor/sqlparser" }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 schemars = { version = "1.1", features = ["preserve_order"] }

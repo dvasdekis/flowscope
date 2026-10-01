@@ -227,3 +227,151 @@ fn cli_accepts_bare_metadata_guard_and_both_data_source_placements() {
         assert!(!has_issue(&result, "PARSE_ERROR"));
     }
 }
+
+#[test]
+fn cli_preserves_nonreserved_keyword_expression_forms() {
+    for sql in [
+        "SELECT INTERVAL FROM dbo.synthetic_table",
+        "SELECT INTERVAL + 1 AS interval_value, INTERVAL implicit_alias FROM dbo.synthetic_table WHERE INTERVAL IS NULL",
+        "SELECT TRY_PARSE(INTERVAL AS DATE USING DATE) FROM dbo.synthetic_table",
+        "SELECT CAST(INTERVAL AS INT), CONVERT(INT, INTERVAL), TRY_CAST(INTERVAL AS INT), TRY_CONVERT(INT, INTERVAL) FROM dbo.synthetic_table",
+    ] {
+        let result = analyze_mssql(sql);
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+        assert!(!has_issue(&result, "PARSE_ERROR"), "{sql}");
+    }
+
+    assert!(has_issue(
+        &analyze_mssql("SELECT INTERVAL FROM dbo."),
+        "PARSE_ERROR"
+    ));
+}
+
+#[test]
+fn cli_accepts_bulk_lists_without_horizontal_whitespace() {
+    for separator in ["", "\n", "\r\n", "/* list boundary */"] {
+        let sql = format!(
+            "SELECT src.id FROM OPENROWSET(BULK{separator}('demo/a.parquet', 'demo/b.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS src"
+        );
+        let result = analyze_mssql(&sql);
+
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+        assert!(!has_issue(&result, "PARSE_ERROR"));
+        assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+        assert!(result["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["type"] != "table"));
+    }
+}
+
+#[test]
+fn cli_accepts_openrowset_schemas_in_procedure_bodies() {
+    let sql = "CREATE OR ALTER PROCEDURE dbo.synthetic_rows AS BEGIN SELECT src.id FROM OPENROWSET(BULK\n('demo/a.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS src; END";
+    let result = analyze_mssql(sql);
+
+    assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+    assert_eq!(result["statements"][0]["statementType"], "CREATE_PROCEDURE");
+    assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+}
+
+#[test]
+fn cli_accepts_guarded_external_tables_without_lineage() {
+    for (condition, begin, end, data_source_first) in [
+        ("NOT EXISTS (SELECT 1)", "", "", false),
+        ("NOT EXISTS (SELECT 1)", "BEGIN ", "; END", true),
+        (
+            "OBJECT_ID(N'dbo.synthetic_rows', N'U') IS NULL",
+            "",
+            "",
+            true,
+        ),
+        (
+            "OBJECT_ID('dbo.synthetic_rows') IS NULL",
+            "BEGIN ",
+            "; END",
+            false,
+        ),
+    ] {
+        let options = if data_source_first {
+            "DATA_SOURCE = synthetic_store, LOCATION = 'demo/'"
+        } else {
+            "LOCATION = 'demo/', DATA_SOURCE = synthetic_store"
+        };
+        let sql = format!(
+            "IF {condition} {begin}CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH ({options}, FILE_FORMAT = synthetic_format){end}"
+        );
+        let result = analyze_mssql(&sql);
+
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["statements"][0]["statementType"],
+            "CREATE_EXTERNAL_TABLE"
+        );
+        assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+        assert!(!has_issue(&result, "PARSE_ERROR"));
+        assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+        assert!(result["nodes"].as_array().unwrap().is_empty());
+        assert!(result["edges"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cli_keeps_malformed_rowset_boundaries_and_table_guards_as_errors() {
+    for sql in [
+        "SELECT * FROM OPENROWSET(BULK\n('demo/a.parquet',), FORMAT = 'PARQUET') AS src",
+        "SELECT * FROM OPENROWSET(BULK(), FORMAT = 'PARQUET') AS src",
+        "CREATE PROCEDURE dbo.synthetic_rows AS BEGIN SELECT * FROM OPENROWSET(BULK('demo/a.parquet'), FORMAT = 'PARQUET') WITH (id) AS src; END",
+        "IF NOT EXISTS (SELECT FROM) CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+        "IF NOT EXISTS (SELECT 1) BEGIN CREATE EXTERNAL TABLE dbo.synthetic_rows (id) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format); END",
+        "IF NOT EXISTS (SELECT 1) CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format) ELSE SELECT 1",
+        "IF OBJECT_ID() IS NULL CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+        "IF OBJECT_ID('dbo.synthetic_rows') CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+        "CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (DATA_SOURCE = synthetic_store, DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
+        "CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (DATA_SOURCE = synthetic_store, LOCATION = '', FILE_FORMAT = synthetic_format)",
+    ] {
+        assert!(has_issue(&analyze_mssql(sql), "PARSE_ERROR"));
+    }
+}
+
+#[test]
+fn cli_accepts_mssql_collation_and_try_parse_expressions() {
+    for sql in [
+        "CREATE OR ALTER VIEW dbo.synthetic_view AS SELECT t.demo_value FROM dbo.synthetic_table AS t WHERE t.demo_value COLLATE Latin1_General_100_CI_AS = N'demo'",
+        "CREATE OR ALTER VIEW dbo.synthetic_view AS SELECT TRY_PARSE(N'2024-01-02' AS DATETIME USING N'en-US') AS parsed_value",
+    ] {
+        let result = analyze_mssql(sql);
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+        assert!(!has_issue(&result, "PARSE_ERROR"));
+    }
+    for sql in [
+        "SELECT t.demo_value COLLATE FROM dbo.synthetic_table AS t",
+        "SELECT TRY_PARSE(N'2024-01-02' AS)",
+    ] {
+        assert!(has_issue(&analyze_mssql(sql), "PARSE_ERROR"));
+    }
+}
+
+#[test]
+fn cli_accepts_optional_terminators_in_procedural_bodies() {
+    for sql in [
+        "CREATE OR ALTER PROCEDURE dbo.synthetic_proc AS BEGIN DECLARE @value INT SELECT @value = 1 END",
+        "BEGIN DECLARE @value INT SELECT @value = 1 END",
+    ] {
+        let result = analyze_mssql(sql);
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+        assert!(!has_issue(&result, "PARSE_ERROR"));
+    }
+    assert!(has_issue(
+        &analyze_mssql(
+            "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN DECLARE @value SELECT FROM END"
+        ),
+        "PARSE_ERROR"
+    ));
+}
