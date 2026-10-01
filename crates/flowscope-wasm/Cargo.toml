@@ -8,6 +8,9 @@ repository.workspace = true
 publish = false
 description = "WASM bindings for flowscope-core"
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz"]
+
 [features]
 default = ["templating"]
 templating = ["flowscope-core/templating"]

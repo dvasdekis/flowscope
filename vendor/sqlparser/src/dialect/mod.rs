@@ -595,6 +595,15 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if the dialect supports a trailing comma after the final column definition
+    /// in a `CREATE TABLE` column list.
+    ///
+    /// This is separate from [`Self::supports_column_definition_trailing_commas`] because that
+    /// capability also applies to other column-definition lists.
+    fn supports_create_table_column_definition_trailing_commas(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports double dot notation for object names
     ///
     /// Example

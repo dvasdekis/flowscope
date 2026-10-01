@@ -8181,7 +8181,7 @@ impl<'a> Parser<'a> {
         };
 
         // parse optional column list (schema)
-        let (columns, constraints) = self.parse_columns()?;
+        let (columns, constraints) = self.parse_create_table_columns()?;
         let comment_after_column_def =
             if dialect_of!(self is HiveDialect) && self.parse_keyword(Keyword::COMMENT) {
                 let next_token = self.next_token();
@@ -8732,6 +8732,19 @@ impl<'a> Parser<'a> {
 
     /// Parse columns and constraints.
     pub fn parse_columns(&mut self) -> Result<(Vec<ColumnDef>, Vec<TableConstraint>), ParserError> {
+        self.parse_columns_inner(false)
+    }
+
+    fn parse_create_table_columns(
+        &mut self,
+    ) -> Result<(Vec<ColumnDef>, Vec<TableConstraint>), ParserError> {
+        self.parse_columns_inner(true)
+    }
+
+    fn parse_columns_inner(
+        &mut self,
+        create_table_column_list: bool,
+    ) -> Result<(Vec<ColumnDef>, Vec<TableConstraint>), ParserError> {
         let mut columns = vec![];
         let mut constraints = vec![];
         if !self.consume_token(&Token::LParen) || self.consume_token(&Token::RParen) {
@@ -8739,13 +8752,17 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            if let Some(constraint) = self.parse_optional_table_constraint()? {
+            let is_column_definition = if let Some(constraint) =
+                self.parse_optional_table_constraint()?
+            {
                 constraints.push(constraint);
+                false
             } else if let Token::Word(_) = self.peek_token().token {
                 columns.push(self.parse_column_def()?);
+                true
             } else {
                 return self.expected("column name or constraint definition", self.peek_token());
-            }
+            };
 
             let comma = self.consume_token(&Token::Comma);
             let rparen = self.peek_token().token == Token::RParen;
@@ -8757,6 +8774,11 @@ impl<'a> Parser<'a> {
             if rparen
                 && (!comma
                     || self.dialect.supports_column_definition_trailing_commas()
+                    || (create_table_column_list
+                        && is_column_definition
+                        && self
+                            .dialect
+                            .supports_create_table_column_definition_trailing_commas())
                     || self.options.trailing_commas)
             {
                 let _ = self.consume_token(&Token::RParen);
@@ -13591,7 +13613,7 @@ impl<'a> Parser<'a> {
                 | Keyword::FULL
                 | Keyword::CROSS => {
                     self.prev_token();
-                    let mut joins = self.parse_joins()?;
+                    let mut joins = self.parse_joins(false)?;
                     if joins.len() != 1 {
                         return Err(ParserError::ParserError(
                             "Join pipe operator must have a single join".to_string(),
@@ -14927,11 +14949,17 @@ impl<'a> Parser<'a> {
         // Note that for keywords to be properly handled here, they need to be
         // added to `RESERVED_FOR_TABLE_ALIAS`, otherwise they may be parsed as
         // a table alias.
-        let joins = self.parse_joins()?;
+        let joins = self.parse_joins(false)?;
         Ok(TableWithJoins { relation, joins })
     }
 
-    fn parse_joins(&mut self) -> Result<Vec<Join>, ParserError> {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
+    fn parse_joins(&mut self, nested: bool) -> Result<Vec<Join>, ParserError> {
+        let _guard = if nested {
+            Some(self.recursion_counter.try_decrease()?)
+        } else {
+            None
+        };
         let mut joins = vec![];
         loop {
             let global = self.parse_keyword(Keyword::GLOBAL);
@@ -15080,7 +15108,7 @@ impl<'a> Parser<'a> {
                     .supports_left_associative_joins_without_parens()
                     && self.peek_parens_less_nested_join()
                 {
-                    let joins = self.parse_joins()?;
+                    let joins = self.parse_joins(true)?;
                     relation = TableFactor::NestedJoin {
                         table_with_joins: Box::new(TableWithJoins { relation, joins }),
                         alias: None,
@@ -16257,6 +16285,8 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::USING) {
             let columns = self.parse_parenthesized_qualified_column_list(Mandatory, false)?;
             Ok(JoinConstraint::Using(columns))
+        } else if dialect_of!(self is MsSqlDialect) {
+            self.expected("ON after JOIN", self.peek_token())
         } else {
             Ok(JoinConstraint::None)
             //self.expected("ON, or USING after JOIN", self.peek_token())
@@ -20223,5 +20253,380 @@ mod tests {
             let sql = format!("\nSELECT\n  :{w}fooBar");
             assert!(Parser::parse_sql(&GenericDialect, &sql).is_err());
         }
+    }
+
+    fn first_from_clause(statements: &[Statement]) -> &TableWithJoins {
+        assert_eq!(statements.len(), 1);
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected a query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected a SELECT");
+        };
+        assert_eq!(select.from.len(), 1);
+        &select.from[0]
+    }
+
+    fn join_condition(join: &Join) -> &Expr {
+        let constraint = match &join.join_operator {
+            JoinOperator::Join(constraint)
+            | JoinOperator::Inner(constraint)
+            | JoinOperator::Left(constraint)
+            | JoinOperator::LeftOuter(constraint)
+            | JoinOperator::Right(constraint)
+            | JoinOperator::RightOuter(constraint)
+            | JoinOperator::FullOuter(constraint) => constraint,
+            _ => panic!("expected a regular join"),
+        };
+        let JoinConstraint::On(expr) = constraint else {
+            panic!("expected an ON condition");
+        };
+        expr
+    }
+
+    fn nested_join_table(join: &Join) -> &TableWithJoins {
+        let TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } = &join.relation
+        else {
+            panic!("expected a nested right-hand join");
+        };
+        assert!(alias.is_none());
+        table_with_joins
+    }
+
+    #[test]
+    fn mssql_join_parses_deferred_outer_on_as_nested_rhs() {
+        let sql = "SELECT a.id FROM dbo.synthetic_a AS a LEFT JOIN dbo.synthetic_b AS b \
+            INNER JOIN dbo.synthetic_c AS c ON b.id = c.id ON a.id = b.id";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, sql).unwrap();
+        let from = first_from_clause(&statements);
+
+        assert_eq!(from.relation.to_string(), "dbo.synthetic_a AS a");
+        assert_eq!(from.joins.len(), 1);
+        let outer = &from.joins[0];
+        assert!(matches!(
+            &outer.join_operator,
+            JoinOperator::Left(JoinConstraint::On(_))
+        ));
+        assert_eq!(join_condition(outer).to_string(), "a.id = b.id");
+
+        let right = nested_join_table(outer);
+        assert_eq!(right.relation.to_string(), "dbo.synthetic_b AS b");
+        assert_eq!(right.joins.len(), 1);
+        let inner = &right.joins[0];
+        assert!(matches!(
+            &inner.join_operator,
+            JoinOperator::Inner(JoinConstraint::On(_))
+        ));
+        assert_eq!(join_condition(inner).to_string(), "b.id = c.id");
+        assert_eq!(inner.relation.to_string(), "dbo.synthetic_c AS c");
+    }
+
+    #[test]
+    fn mssql_join_parses_inner_only_deferred_on_as_nested_rhs() {
+        let sql = "SELECT a.id FROM dbo.synthetic_a AS a JOIN dbo.synthetic_b AS b \
+            JOIN dbo.synthetic_c AS c ON b.id = c.id ON a.id = b.id";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, sql).unwrap();
+        let from = first_from_clause(&statements);
+
+        assert_eq!(from.joins.len(), 1);
+        let outer = &from.joins[0];
+        assert!(matches!(
+            &outer.join_operator,
+            JoinOperator::Join(JoinConstraint::On(_))
+        ));
+        assert_eq!(join_condition(outer).to_string(), "a.id = b.id");
+
+        let right = nested_join_table(outer);
+        assert_eq!(right.relation.to_string(), "dbo.synthetic_b AS b");
+        assert_eq!(right.joins.len(), 1);
+        let inner = &right.joins[0];
+        assert!(matches!(
+            &inner.join_operator,
+            JoinOperator::Join(JoinConstraint::On(_))
+        ));
+        assert_eq!(join_condition(inner).to_string(), "b.id = c.id");
+        assert_eq!(inner.relation.to_string(), "dbo.synthetic_c AS c");
+    }
+
+    #[test]
+    fn mssql_join_preserves_outer_join_kinds_in_longer_nested_rhs() {
+        let sql = "SELECT a.id FROM dbo.synthetic_a AS a \
+            LEFT JOIN dbo.synthetic_b AS b \
+            RIGHT JOIN dbo.synthetic_c AS c \
+            FULL OUTER JOIN dbo.synthetic_d AS d \
+            ON c.id = d.id ON b.id = c.id ON a.id = b.id";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, sql).unwrap();
+        let from = first_from_clause(&statements);
+
+        assert_eq!(from.joins.len(), 1);
+        let left = &from.joins[0];
+        assert!(matches!(
+            &left.join_operator,
+            JoinOperator::Left(JoinConstraint::On(_))
+        ));
+        assert_eq!(join_condition(left).to_string(), "a.id = b.id");
+
+        let right = nested_join_table(left);
+        assert_eq!(right.relation.to_string(), "dbo.synthetic_b AS b");
+        assert_eq!(right.joins.len(), 1);
+        let right_outer = &right.joins[0];
+        assert!(matches!(
+            &right_outer.join_operator,
+            JoinOperator::Right(JoinConstraint::On(_))
+        ));
+        assert_eq!(join_condition(right_outer).to_string(), "b.id = c.id");
+
+        let full = nested_join_table(right_outer);
+        assert_eq!(full.relation.to_string(), "dbo.synthetic_c AS c");
+        assert_eq!(full.joins.len(), 1);
+        let full_outer = &full.joins[0];
+        assert!(matches!(
+            &full_outer.join_operator,
+            JoinOperator::FullOuter(JoinConstraint::On(_))
+        ));
+        assert_eq!(join_condition(full_outer).to_string(), "c.id = d.id");
+        assert_eq!(full_outer.relation.to_string(), "dbo.synthetic_d AS d");
+    }
+
+    #[test]
+    fn mssql_join_supports_derived_rhs_and_explicit_parentheses() {
+        let derived_sql = "SELECT a.id FROM dbo.synthetic_a AS a \
+            LEFT JOIN (SELECT b.id FROM dbo.synthetic_b AS b) AS b \
+            INNER JOIN (SELECT c.id FROM dbo.synthetic_c AS c) AS c \
+            ON b.id = c.id ON a.id = b.id";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, derived_sql).unwrap();
+        let from = first_from_clause(&statements);
+        assert_eq!(from.joins.len(), 1);
+        let right = nested_join_table(&from.joins[0]);
+        assert!(matches!(right.relation, TableFactor::Derived { .. }));
+        assert_eq!(right.joins.len(), 1);
+        assert!(matches!(
+            right.joins[0].relation,
+            TableFactor::Derived { .. }
+        ));
+        assert_eq!(join_condition(&right.joins[0]).to_string(), "b.id = c.id");
+
+        let explicitly_nested = "SELECT a.id FROM dbo.synthetic_a AS a \
+            LEFT JOIN (dbo.synthetic_b AS b INNER JOIN dbo.synthetic_c AS c \
+                ON b.id = c.id) ON a.id = b.id";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, explicitly_nested).unwrap();
+        let from = first_from_clause(&statements);
+        assert_eq!(from.joins.len(), 1);
+        let right = nested_join_table(&from.joins[0]);
+        assert_eq!(right.relation.to_string(), "dbo.synthetic_b AS b");
+        assert_eq!(join_condition(&right.joins[0]).to_string(), "b.id = c.id");
+        assert_eq!(join_condition(&from.joins[0]).to_string(), "a.id = b.id");
+
+        let explicitly_left_nested = "SELECT a.id FROM \
+            (dbo.synthetic_a AS a LEFT JOIN dbo.synthetic_b AS b ON a.id = b.id) \
+            INNER JOIN dbo.synthetic_c AS c ON b.id = c.id";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, explicitly_left_nested).unwrap();
+        let from = first_from_clause(&statements);
+        assert_eq!(from.joins.len(), 1);
+        assert!(matches!(
+            &from.joins[0].join_operator,
+            JoinOperator::Inner(JoinConstraint::On(_))
+        ));
+        let TableFactor::NestedJoin {
+            table_with_joins: left,
+            alias: None,
+        } = &from.relation
+        else {
+            panic!("expected explicit left nesting to be retained");
+        };
+        assert_eq!(left.joins.len(), 1);
+        assert!(matches!(
+            &left.joins[0].join_operator,
+            JoinOperator::Left(JoinConstraint::On(_))
+        ));
+    }
+
+    #[test]
+    fn mssql_nested_join_keeps_comments_and_source_spans() {
+        use crate::ast::Spanned;
+
+        let sql = "SELECT a.id FROM dbo.synthetic_a AS a /* outer */ \
+            LEFT JOIN dbo.synthetic_b AS b -- right-hand relation\n\
+            INNER JOIN dbo.synthetic_c AS c /* inner predicate */ \
+            ON b.id = c.id /* outer predicate */ ON a.id = b.id";
+        let (statements, comments) =
+            Parser::parse_sql_with_comments(&MsSqlDialect {}, sql).unwrap();
+        assert_eq!(comments.find(..).count(), 4);
+
+        let from = first_from_clause(&statements);
+        let span = from.span();
+        assert_eq!(
+            span.start,
+            location_at(sql, sql.find("dbo.synthetic_a").unwrap())
+        );
+        let outer_condition = "a.id = b.id";
+        let outer_condition_start = sql.rfind(outer_condition).unwrap();
+        assert_eq!(
+            span.end,
+            location_at(sql, outer_condition_start + outer_condition.len())
+        );
+        assert_eq!(join_condition(&from.joins[0]).to_string(), outer_condition);
+        assert_eq!(
+            join_condition(&nested_join_table(&from.joins[0]).joins[0]).to_string(),
+            "b.id = c.id"
+        );
+    }
+
+    fn location_at(sql: &str, offset: usize) -> Location {
+        let prefix = &sql[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix.rsplit('\n').next().unwrap().len() + 1;
+        Location::new(line as u64, column as u64)
+    }
+
+    #[test]
+    fn mssql_flat_joins_and_other_dialects_keep_existing_behavior() {
+        let flat_sql = "SELECT a.id FROM a LEFT JOIN b ON a.id = b.id \
+            INNER JOIN c ON b.id = c.id";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, flat_sql).unwrap();
+        let from = first_from_clause(&statements);
+        assert_eq!(from.joins.len(), 2);
+        assert!(matches!(
+            &from.joins[0].join_operator,
+            JoinOperator::Left(JoinConstraint::On(_))
+        ));
+        assert!(matches!(
+            &from.joins[1].join_operator,
+            JoinOperator::Inner(JoinConstraint::On(_))
+        ));
+        assert!(!matches!(
+            from.joins[0].relation,
+            TableFactor::NestedJoin { .. }
+        ));
+
+        let statements = Parser::parse_sql(&GenericDialect {}, flat_sql).unwrap();
+        assert_eq!(first_from_clause(&statements).joins.len(), 2);
+        assert!(Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM a JOIN b JOIN c ON b.id = c.id ON a.id = b.id"
+        )
+        .is_err());
+        assert!(Parser::parse_sql(&GenericDialect {}, "SELECT * FROM a LEFT JOIN b").is_ok());
+    }
+
+    #[test]
+    fn mssql_joins_reject_missing_or_extra_on_conditions() {
+        for sql in [
+            "SELECT * FROM a LEFT JOIN b",
+            "SELECT * FROM a LEFT JOIN b INNER JOIN c ON b.id = c.id",
+            "SELECT * FROM a LEFT JOIN b INNER JOIN c ON b.id = c.id \
+                ON a.id = b.id ON c.id = a.id",
+        ] {
+            assert!(
+                Parser::parse_sql(&MsSqlDialect {}, sql).is_err(),
+                "unexpectedly accepted malformed join: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn mssql_nested_joins_respect_recursion_limit() {
+        let join_count = 24;
+        let mut sql = String::from("SELECT * FROM t0");
+        for right_table in 1..=join_count {
+            sql.push_str(&format!(" INNER JOIN t{right_table}"));
+        }
+        for left_table in (0..join_count).rev() {
+            sql.push_str(&format!(" ON t{left_table}.id = t{}.id", left_table + 1));
+        }
+
+        let result = Parser::new(&MsSqlDialect {})
+            .with_recursion_limit(8)
+            .try_with_sql(&sql)
+            .unwrap()
+            .parse_statements();
+        assert_eq!(result, Err(ParserError::RecursionLimitExceeded));
+    }
+
+    #[test]
+    fn mssql_create_table_accepts_a_trailing_column_comma() {
+        use crate::ast::Spanned;
+
+        let sql = "CREATE TABLE #synthetic_result (demo_value NVARCHAR(MAX),);";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        let Statement::CreateTable(table) = &statements[0] else {
+            panic!("expected a CREATE TABLE statement");
+        };
+
+        assert_eq!(table.name.to_string(), "#synthetic_result");
+        assert_eq!(table.columns.len(), 1);
+        assert_eq!(table.columns[0].name.value, "demo_value");
+        assert_eq!(table.columns[0].to_string(), "demo_value NVARCHAR(MAX)");
+
+        let name_start = sql.find("demo_value").unwrap();
+        let column_span = table.columns[0].span();
+        assert_eq!(column_span.start, location_at(sql, name_start));
+        assert_eq!(
+            column_span.end,
+            location_at(sql, name_start + "demo_value".len())
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_column_trailing_comma_parses_inside_procedure() {
+        let sql = "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN \
+            CREATE TABLE #synthetic_result (demo_value NVARCHAR(MAX),); END;";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, sql).unwrap();
+
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(&statements[0], Statement::CreateProcedure { .. }));
+    }
+
+    #[test]
+    fn mssql_create_table_column_trailing_comma_is_narrowly_scoped() {
+        let valid_constraint_list = "CREATE TABLE #synthetic_constraint \
+            (demo_value NVARCHAR(MAX), CONSTRAINT pk_synthetic PRIMARY KEY (demo_value));";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, valid_constraint_list).unwrap();
+        let Statement::CreateTable(table_with_constraint) = &statements[0] else {
+            panic!("expected a CREATE TABLE statement");
+        };
+        assert_eq!(table_with_constraint.columns.len(), 1);
+        assert_eq!(table_with_constraint.constraints.len(), 1);
+
+        for sql in [
+            "CREATE TABLE #synthetic_empty (,);",
+            "CREATE TABLE #synthetic_double (demo_value NVARCHAR(MAX),,);",
+            "CREATE TABLE #synthetic_invalid (demo_value,);",
+            "CREATE TABLE #synthetic_unclosed (demo_value NVARCHAR(MAX),",
+            "CREATE TABLE #synthetic_constraint (demo_value NVARCHAR(MAX), \
+                CONSTRAINT pk_synthetic PRIMARY KEY (demo_value),);",
+            "SELECT COALESCE(1,);",
+        ] {
+            assert!(
+                Parser::parse_sql(&MsSqlDialect {}, sql).is_err(),
+                "unexpectedly accepted malformed or out-of-scope SQL: {sql}"
+            );
+        }
+
+        let empty_columns =
+            Parser::parse_sql(&MsSqlDialect {}, "CREATE TABLE #synthetic_empty ();").unwrap();
+        let Statement::CreateTable(empty_table) = &empty_columns[0] else {
+            panic!("expected a CREATE TABLE statement");
+        };
+        assert!(empty_table.columns.is_empty());
+        assert!(empty_table.constraints.is_empty());
+
+        let trailing_table_column = "CREATE TABLE #synthetic_result (demo_value NVARCHAR(MAX),);";
+        assert!(Parser::parse_sql(&GenericDialect {}, trailing_table_column).is_err());
+        assert!(Parser::parse_sql(&PostgreSqlDialect {}, trailing_table_column).is_err());
+    }
+
+    #[test]
+    fn mssql_create_table_column_trailing_comma_does_not_change_procedure_parameters() {
+        let sql = "CREATE PROCEDURE dbo.synthetic_parameter_proc \
+            (@demo_value INT,) AS SELECT @demo_value;";
+        let statements = Parser::parse_sql(&MsSqlDialect {}, sql).unwrap();
+
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(&statements[0], Statement::CreateProcedure { .. }));
     }
 }

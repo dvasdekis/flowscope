@@ -147,10 +147,15 @@ const harness = `<!doctype html>
         "SELECT INTERVAL + 1 AS interval_value, INTERVAL implicit_alias FROM dbo.synthetic_table WHERE INTERVAL IS NULL",
         "SELECT TRY_PARSE(INTERVAL AS DATE USING DATE) FROM dbo.synthetic_table",
         "SELECT CAST(INTERVAL AS INT), CONVERT(INT, INTERVAL), TRY_CAST(INTERVAL AS INT), TRY_CONVERT(INT, INTERVAL) FROM dbo.synthetic_table",
+        "SELECT a.id FROM dbo.synthetic_a AS a LEFT JOIN dbo.synthetic_b AS b INNER JOIN dbo.synthetic_c AS c ON b.id = c.id ON a.id = b.id",
       ].map(analyzeMssql);
       const optionalTerminatorResults = [
         "CREATE OR ALTER PROCEDURE dbo.synthetic_proc AS BEGIN DECLARE @value INT SELECT @value = 1 END",
         "BEGIN DECLARE @value INT SELECT @value = 1 END",
+      ].map(analyzeMssql);
+      const tableColumnCommaResults = [
+        "CREATE TABLE #synthetic_result (demo_value NVARCHAR(MAX),);",
+        "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN CREATE TABLE #synthetic_result (demo_value NVARCHAR(MAX),); END;",
       ].map(analyzeMssql);
       const malformedSynapseResults = [
         malformedBareMetadataResult,
@@ -171,6 +176,9 @@ const harness = `<!doctype html>
           "SELECT t.demo_value COLLATE FROM dbo.synthetic_table AS t",
           "SELECT TRY_PARSE(N'2024-01-02' AS)",
           "SELECT INTERVAL FROM dbo.",
+          "SELECT a.id FROM dbo.synthetic_a AS a LEFT JOIN dbo.synthetic_b AS b INNER JOIN dbo.synthetic_c AS c ON b.id = c.id ON",
+          "CREATE TABLE #synthetic_result (demo_value INT,,);",
+          "SELECT COALESCE(1,);",
           "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN DECLARE @value SELECT FROM END",
           "IF OBJECT_ID() IS NULL CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
           "IF OBJECT_ID('dbo.synthetic_rows') CREATE EXTERNAL TABLE dbo.synthetic_rows (id INT) WITH (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, FILE_FORMAT = synthetic_format)",
@@ -281,10 +289,10 @@ const harness = `<!doctype html>
       if (!guardedTableResults.every((table) => isMetadata(table, 'CREATE_EXTERNAL_TABLE'))) {
         throw new Error('Guarded external-table metadata analysis failed');
       }
-      if (![...mssqlExpressionResults, ...optionalTerminatorResults].every(
+      if (![...mssqlExpressionResults, ...optionalTerminatorResults, ...tableColumnCommaResults].every(
         (statement) => statement.statements.length === 1 && !hasIssue(statement, 'PARSE_ERROR')
       )) {
-        throw new Error('MSSQL expression or optional procedural terminator analysis failed');
+        throw new Error('MSSQL expression, table-column comma or optional terminator analysis failed');
       }
       if (malformedSynapseResults.some((synapseResult) => !hasIssue(synapseResult, 'PARSE_ERROR'))) {
         throw new Error(
@@ -312,6 +320,7 @@ const harness = `<!doctype html>
         guardedExternalTables: guardedTableResults.length,
         mssqlExpressions: mssqlExpressionResults.length,
         optionalProceduralTerminators: optionalTerminatorResults.length,
+        tableColumnTrailingCommas: tableColumnCommaResults.length,
         malformedSynapseCases: malformedSynapseResults.length,
       });
     } catch (error) {

@@ -206,13 +206,7 @@ to npm. See [docs/guides/quickstart.md](docs/guides/quickstart.md) for a core AP
 
 FlowScope uses `just` for common tasks. Run `just build`, `just test`, or `just dev`, and see [docs/workspace-structure.md](docs/workspace-structure.md) for the full command list.
 
-The checked-in browser WASM receives an additional size-optimization pass with Binaryen 117 after the normal release build. With that version of `wasm-opt` available, reproduce the extra pass after `just build-wasm`:
-
-```sh
-wasm-opt -Oz packages/core/wasm/flowscope_wasm_bg.wasm -o packages/core/wasm/flowscope_wasm_bg.wasm
-```
-
-The app's 9 MiB WASM budget remains enforced; the normal optimized release build also fits without this optional extra pass.
+Browser release builds use Binaryen's `-Oz` size optimization, configured in the WASM crate's `wasm-pack` release metadata. `just build-wasm` and release CI use that same configuration to keep the canonical `packages/core/wasm/flowscope_wasm_bg.wasm` within the app's enforced 9 MiB budget.
 
 ## Contributing
 

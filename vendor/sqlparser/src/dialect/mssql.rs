@@ -65,6 +65,17 @@ impl Dialect for MsSqlDialect {
         true
     }
 
+    /// T-SQL allows a `<joined_table>` as a join operand, including on the
+    /// right-hand side before the outer join's `ON` condition.
+    /// <https://learn.microsoft.com/en-us/sql/t-sql/queries/from-transact-sql?view=sql-server-ver17>
+    fn supports_left_associative_joins_without_parens(&self) -> bool {
+        false
+    }
+
+    fn supports_create_table_column_definition_trailing_commas(&self) -> bool {
+        true
+    }
+
     fn supports_connect_by(&self) -> bool {
         true
     }

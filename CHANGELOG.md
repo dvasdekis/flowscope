@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Parsed MSSQL right-nested joins with deferred `ON` clauses while preserving join grouping, predicate ownership, recursion limits, and outer-join semantics.
+- Accepted the owner-confirmed Serverless SQL pool trailing comma after a complete `CREATE TABLE` column list, including temporary tables inside procedures, without relaxing function arguments or other comma-separated lists.
+- Configured release WASM builds to use size-oriented optimization so standard build and CI output stay within the existing 9 MiB budget.
 - Accepted MSSQL inline table-valued function `RETURN WITH ... SELECT ...` bodies without outer parentheses, including EOF without a final semicolon, while preserving source spans and rejecting malformed returns.
 - Used the T-SQL reserved-keyword policy for MSSQL identifiers, preserving nonreserved spellings such as `TRIM` and `INTERVAL` as column references in projections, arithmetic, aliases, predicates, and `TRY_PARSE` arguments without changing other dialects or masking malformed expressions.
 - Removed the OPENROWSET adapter's horizontal-whitespace requirement through token-level adaptation, preserving original spans for newline, adjacent-parenthesis, and comments-only `BULK` boundaries.

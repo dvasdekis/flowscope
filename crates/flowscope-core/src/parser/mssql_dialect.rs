@@ -38,6 +38,15 @@ impl Dialect for MssqlParserDialect {
         self.0.supports_outer_join_operator()
     }
 
+    fn supports_left_associative_joins_without_parens(&self) -> bool {
+        self.0.supports_left_associative_joins_without_parens()
+    }
+
+    fn supports_create_table_column_definition_trailing_commas(&self) -> bool {
+        self.0
+            .supports_create_table_column_definition_trailing_commas()
+    }
+
     fn supports_connect_by(&self) -> bool {
         self.0.supports_connect_by()
     }
@@ -440,6 +449,13 @@ mod tests {
     };
     use sqlparser::dialect::GenericDialect;
     use sqlparser::tokenizer::Location;
+
+    #[test]
+    fn wrapper_forwards_mssql_join_and_table_column_capabilities() {
+        let dialect = MssqlParserDialect::default();
+        assert!(!dialect.supports_left_associative_joins_without_parens());
+        assert!(dialect.supports_create_table_column_definition_trailing_commas());
+    }
 
     #[test]
     fn reserved_keyword_set_matches_mssql_not_generic_sql_keywords() {

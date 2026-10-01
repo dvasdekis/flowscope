@@ -451,6 +451,17 @@ impl<'a> ExternalMetadataParser<'a> {
             })?;
         let open = self.tokens[column_list_start];
         let close = self.tokens[close_after - 1];
+        if let Some(comma) = close_after
+            .checked_sub(2)
+            .and_then(|index| self.tokens.get(index).copied())
+            .filter(|token| matches!(&token.token, Token::Comma))
+        {
+            return Err(self.error_at(
+                Some(comma),
+                "Trailing commas in external table columns are outside the supported subset",
+                ParseErrorKind::UnsupportedFeature,
+            ));
+        }
         let column_range = token_byte_range(self.source_sql, open)
             .zip(token_byte_range(self.source_sql, close))
             .map(|(start, end)| start.start..end.end)
@@ -2414,6 +2425,21 @@ mod tests {
                     .expect("invalid SELECT"),
             "condition diagnostics must point to the original IF query"
         );
+    }
+
+    #[test]
+    fn external_table_columns_do_not_inherit_standard_table_trailing_commas() {
+        let sql = "/* café */ CREATE EXTERNAL TABLE dbo.synthetic_external \
+                   (demo_value INT, /* trailing */) WITH \
+                   (LOCATION = 'demo/', DATA_SOURCE = synthetic_store, \
+                   FILE_FORMAT = synthetic_format)";
+        let error = parse_format(sql).expect_err("external subset remains unchanged");
+        assert_eq!(error.kind, ParseErrorKind::UnsupportedFeature);
+        let position = error.position.expect("original comma position");
+        let offset =
+            crate::analyzer::helpers::line_col_to_offset(sql, position.line, position.column)
+                .expect("original source offset");
+        assert_eq!(offset, sql.find(", /* trailing */").unwrap());
     }
 
     #[test]

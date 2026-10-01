@@ -311,6 +311,66 @@ fn analyze_sql_json_preserves_nonreserved_keyword_expression_forms() {
 }
 
 #[test]
+fn analyze_sql_json_accepts_right_nested_mssql_joins_with_deferred_conditions() {
+    for join_type in ["INNER", "LEFT", "RIGHT", "FULL"] {
+        let sql = format!(
+            "SELECT a.id FROM dbo.synthetic_a AS a {join_type} JOIN dbo.synthetic_b AS b INNER JOIN dbo.synthetic_c AS c ON b.id = c.id ON a.id = b.id"
+        );
+        let result = analyze_mssql(&sql);
+        assert!(!has_issue(&result, "PARSE_ERROR"), "{sql}");
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+        assert_eq!(
+            result["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|node| node["type"] == "table")
+                .count(),
+            3,
+        );
+    }
+
+    let sql = "SELECT a.id FROM OPENROWSET(BULK('demo/a.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS a LEFT JOIN OPENROWSET(BULK('demo/b.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS b INNER JOIN OPENROWSET(BULK('demo/c.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS c ON b.id = c.id ON a.id = b.id";
+    let result = analyze_mssql(sql);
+    assert!(!has_issue(&result, "PARSE_ERROR"));
+    assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+    assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"));
+    assert!(result["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["type"] != "table"));
+
+    assert!(has_issue(
+        &analyze_mssql("SELECT a.id FROM dbo.synthetic_a AS a LEFT JOIN dbo.synthetic_b AS b INNER JOIN dbo.synthetic_c AS c ON b.id = c.id ON"),
+        "PARSE_ERROR",
+    ));
+}
+
+#[test]
+fn analyze_sql_json_accepts_mssql_table_column_trailing_comma_only() {
+    for sql in [
+        "CREATE TABLE #synthetic_result (demo_value NVARCHAR(MAX),);",
+        "CREATE PROCEDURE dbo.synthetic_proc AS BEGIN CREATE TABLE #synthetic_result (demo_value NVARCHAR(MAX),); END;",
+    ] {
+        let result = analyze_mssql(sql);
+        assert!(!has_issue(&result, "PARSE_ERROR"), "{sql}");
+        assert_eq!(result["statements"].as_array().unwrap().len(), 1);
+        assert_eq!(result["statements"][0]["span"]["end"], sql.len());
+    }
+
+    for sql in [
+        "CREATE TABLE #synthetic_result (,);",
+        "CREATE TABLE #synthetic_result (demo_value INT,,);",
+        "CREATE TABLE #synthetic_result (demo_value INT,;",
+        "SELECT COALESCE(1,);",
+    ] {
+        assert!(has_issue(&analyze_mssql(sql), "PARSE_ERROR"), "{sql}");
+    }
+}
+
+#[test]
 fn analyze_sql_json_accepts_bulk_lists_without_horizontal_whitespace() {
     for separator in ["", "\n", "\r\n", "/* list boundary */"] {
         let sql = format!(
