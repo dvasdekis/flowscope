@@ -110,6 +110,7 @@ See [CLI documentation](crates/flowscope-cli/README.md) for all options.
 
 - Local SQL lineage analysis by default, with explicit provider requests only when Librarian is configured and used
 - Multi-dialect coverage (PostgreSQL, Snowflake, BigQuery, DuckDB, Redshift, and more)
+- MSSQL parsing supports `GO` batches, T-SQL module headers, Synapse external file-format metadata, common `OPENROWSET(BULK ...)` CSV, Delta, and Parquet forms (including declared column schemas), and a narrow CETAS form; external-file and CETAS write lineage remain explicitly unsupported
 - dbt and Jinja templating support with built-in macro stubs (`ref()`, `source()`, `var()`)
 - Table and column lineage with schema-aware wildcard expansion
 - SQL linting with 72 rules across 9 categories (aliasing, layout, convention, structure, and more)
@@ -123,6 +124,7 @@ See [CLI documentation](crates/flowscope-cli/README.md) for all options.
 
 - `app/` — the hosted web application at [flowscope.pondpilot.io](https://flowscope.pondpilot.io)
 - `crates/` — Rust engine, WASM bindings, and CLI
+- `vendor/sqlparser/` — publishable `flowscope-sqlparser` fork of upstream 0.61.0 with typed MSSQL `TRY_PARSE` support
 - `packages/` — published TypeScript API and private React visualization workspace
 
 ## TypeScript API
@@ -203,6 +205,8 @@ to npm. See [docs/guides/quickstart.md](docs/guides/quickstart.md) for a core AP
 ## Development
 
 FlowScope uses `just` for common tasks. Run `just build`, `just test`, or `just dev`, and see [docs/workspace-structure.md](docs/workspace-structure.md) for the full command list.
+
+Browser release builds use Binaryen's `-Oz` size optimization, configured in the WASM crate's `wasm-pack` release metadata. `just build-wasm` and release CI use that same configuration to keep the canonical `packages/core/wasm/flowscope_wasm_bg.wasm` within the app's enforced 9 MiB budget.
 
 ## Contributing
 

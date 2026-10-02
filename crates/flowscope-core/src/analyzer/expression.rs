@@ -16,7 +16,7 @@ use super::functions;
 use super::helpers::check_expr_types;
 use super::Analyzer;
 use crate::generated;
-use crate::types::{AggregationInfo, FilterClauseType};
+use crate::types::{issue_codes, AggregationInfo, FilterClauseType, Issue};
 use crate::Dialect;
 use sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr};
 use std::collections::HashSet;
@@ -79,6 +79,34 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
         let column_refs = self.extract_column_refs_with_warning(expr);
         for col_ref in column_refs {
             if let Some(table) = col_ref.table.as_deref() {
+                if let Some(columns) = self.ctx.external_rowset_columns(table) {
+                    if !columns.is_empty()
+                        && !columns.iter().any(|column| {
+                            self.analyzer.normalize_identifier(&column.name)
+                                == self.analyzer.normalize_identifier(&col_ref.column)
+                        })
+                    {
+                        let available_columns = columns
+                            .iter()
+                            .map(|column| column.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let mut issue = Issue::warning(
+                            issue_codes::UNKNOWN_COLUMN,
+                            format!(
+                                "Column '{}' not found in declared columns for external OPENROWSET alias '{}'. Available columns: {}",
+                                col_ref.column, table, available_columns
+                            ),
+                        )
+                        .with_statement(self.ctx.statement_index);
+                        if let Some(span) = self.analyzer.find_span(&col_ref.column) {
+                            issue = issue.with_span(span);
+                        }
+                        self.analyzer.issues.push(issue);
+                    }
+                    continue;
+                }
+
                 if let Some(canonical) = self.analyzer.resolve_table_alias(self.ctx, Some(table)) {
                     self.analyzer
                         .validate_column(self.ctx, &canonical, &col_ref.column);
@@ -117,6 +145,13 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             Expr::BinaryOp { left, right, .. } => {
                 self.visit_expression_for_subqueries(left, next_depth);
                 self.visit_expression_for_subqueries(right, next_depth);
+            }
+            Expr::Collate { expr, .. } => self.visit_expression_for_subqueries(expr, next_depth),
+            Expr::TryParse { expr, culture, .. } => {
+                self.visit_expression_for_subqueries(expr, next_depth);
+                if let Some(culture) = culture {
+                    self.visit_expression_for_subqueries(culture, next_depth);
+                }
             }
             Expr::UnaryOp { expr, .. } => self.visit_expression_for_subqueries(expr, next_depth),
             Expr::Nested(expr) => self.visit_expression_for_subqueries(expr, next_depth),
@@ -289,6 +324,15 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             Expr::Cast { expr, .. } => {
                 depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
             }
+            Expr::Collate { expr, .. } => {
+                depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
+            }
+            Expr::TryParse { expr, culture, .. } => {
+                depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
+                if let Some(culture) = culture {
+                    depth_limited |= Self::collect_column_refs(culture, refs, dialect, next_depth);
+                }
+            }
             Expr::Nested(inner) => {
                 depth_limited |= Self::collect_column_refs(inner, refs, dialect, next_depth);
             }
@@ -427,8 +471,16 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             Expr::BinaryOp { left, right, .. } => self
                 .find_aggregate_function(left, next_depth)
                 .or_else(|| self.find_aggregate_function(right, next_depth)),
-            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-                self.find_aggregate_function(expr, next_depth)
+            Expr::UnaryOp { expr, .. }
+            | Expr::Nested(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. } => self.find_aggregate_function(expr, next_depth),
+            Expr::TryParse { expr, culture, .. } => {
+                self.find_aggregate_function(expr, next_depth).or_else(|| {
+                    culture
+                        .as_deref()
+                        .and_then(|culture| self.find_aggregate_function(culture, next_depth))
+                })
             }
             Expr::Case {
                 operand,
@@ -691,6 +743,7 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             // Single expression wrappers
             Expr::UnaryOp { expr: e, .. }
             | Expr::Cast { expr: e, .. }
+            | Expr::Collate { expr: e, .. }
             | Expr::Nested(e)
             | Expr::Extract { expr: e, .. }
             | Expr::Ceil { expr: e, .. }
@@ -705,6 +758,13 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             | Expr::IsNotUnknown(e)
             | Expr::JsonAccess { value: e, .. } => {
                 Self::collect_simple_identifiers(e, identifiers, next_depth);
+            }
+
+            Expr::TryParse { expr, culture, .. } => {
+                Self::collect_simple_identifiers(expr, identifiers, next_depth);
+                if let Some(culture) = culture {
+                    Self::collect_simple_identifiers(culture, identifiers, next_depth);
+                }
             }
 
             // Two expression patterns (left/right)
@@ -851,5 +911,36 @@ mod tests {
             refs.is_empty(),
             "no column refs should be recorded when guard triggers"
         );
+    }
+
+    #[test]
+    fn collect_column_refs_walks_collate_try_parse_input_and_culture() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Collate {
+                expr: Box::new(Expr::CompoundIdentifier(vec![
+                    ast::Ident::new("t"),
+                    ast::Ident::new("demo_value"),
+                ])),
+                collation: ast::ObjectName::from(ast::Ident::new("Latin1_General_100_CI_AS")),
+            }),
+            op: ast::BinaryOperator::Eq,
+            right: Box::new(Expr::TryParse {
+                expr: Box::new(Expr::Identifier(ast::Ident::new("source_value"))),
+                data_type: ast::DataType::Datetime(None),
+                culture: Some(Box::new(Expr::Identifier(ast::Ident::new("culture_value")))),
+            }),
+        };
+
+        let (refs, depth_limited) =
+            ExpressionAnalyzer::extract_column_refs_with_dialect(&expr, Dialect::Generic);
+
+        assert!(!depth_limited);
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].table.as_deref(), Some("t"));
+        assert_eq!(refs[0].column, "demo_value");
+        assert_eq!(refs[1].table, None);
+        assert_eq!(refs[1].column, "source_value");
+        assert_eq!(refs[2].table, None);
+        assert_eq!(refs[2].column, "culture_value");
     }
 }

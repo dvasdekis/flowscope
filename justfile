@@ -267,6 +267,10 @@ test: test-rust test-ts
 test-rust:
     cargo test --workspace
 
+# Run the opt-in, aggregate-only private corpus parser measurement (#14-#15).
+private-corpus-parse:
+    cargo test -p flowscope-core --test private_corpus_parse -- --ignored --nocapture
+
 # Run lineage engine tests specifically
 test-lineage:
     cargo test -p flowscope-core --test lineage_engine

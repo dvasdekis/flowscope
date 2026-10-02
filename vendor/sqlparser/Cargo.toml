@@ -1,0 +1,61 @@
+# FlowScope downstream fork of Apache sqlparser 0.61.0. Keep Cargo.toml.orig
+# unchanged as the upstream manifest provenance; this manifest describes the
+# independently versioned and publishable FlowScope package.
+[package]
+name = "flowscope-sqlparser"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FlowScope-maintained sqlparser 0.61 fork with typed MSSQL TRY_PARSE AST support"
+homepage = "https://github.com/pondpilot/flowscope"
+documentation = "https://docs.rs/flowscope-sqlparser"
+readme = "README.md"
+keywords = ["ansi", "sql", "lexer", "parser"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE.TXT",
+    "README.md",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[package.metadata.docs.rs]
+features = ["serde", "visitor", "derive-dialect"]
+
+[package.metadata.flowscope-sqlparser]
+upstream-package = "sqlparser"
+upstream-version = "0.61.0"
+upstream-repository = "https://github.com/apache/datafusion-sqlparser-rs"
+fork-purpose = "Adds typed MSSQL TRY_PARSE AST support required by FlowScope."
+
+[features]
+default = ["std", "recursive-protection"]
+derive-dialect = ["sqlparser_derive"]
+json_example = ["serde_json", "serde"]
+recursive-protection = ["std", "recursive"]
+std = []
+visitor = ["sqlparser_derive"]
+
+[lib]
+name = "sqlparser"
+path = "src/lib.rs"
+
+[dependencies]
+bigdecimal = { version = "0.4.1", features = ["serde"], optional = true }
+log = "0.4"
+recursive = { version = "0.1.1", optional = true }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
+serde_json = { version = "1.0", optional = true }
+sqlparser_derive = { version = "0.5.0", optional = true }
+
+[dev-dependencies]
+matches = "0.1"
+pretty_assertions = "1"
+simple_logger = "5.0"

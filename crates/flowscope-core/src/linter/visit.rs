@@ -272,6 +272,7 @@ pub fn visit_expr<F: FnMut(&Expr)>(expr: &Expr, visitor: &mut F) {
                 visit_expr(el, visitor);
             }
         }
+
         Expr::Function(func) => match &func.args {
             FunctionArguments::Subquery(query) => visit_query_expressions(query, visitor),
             FunctionArguments::List(arg_list) => {
@@ -308,7 +309,15 @@ pub fn visit_expr<F: FnMut(&Expr)>(expr: &Expr, visitor: &mut F) {
             }
             FunctionArguments::None => {}
         },
-        Expr::Cast { expr: inner, .. } => visit_expr(inner, visitor),
+        Expr::Cast { expr: inner, .. } | Expr::Collate { expr: inner, .. } => {
+            visit_expr(inner, visitor)
+        }
+        Expr::TryParse { expr, culture, .. } => {
+            visit_expr(expr, visitor);
+            if let Some(culture) = culture {
+                visit_expr(culture, visitor);
+            }
+        }
         Expr::InSubquery {
             expr: inner,
             subquery,
@@ -393,5 +402,40 @@ fn visit_table_factor_expressions<F: FnMut(&Expr)>(table_factor: &TableFactor, v
             visit_table_factor_expressions(table, visitor)
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visit_expr;
+    use sqlparser::ast::{DataType, Expr, Ident, ObjectName};
+
+    #[test]
+    fn visits_try_parse_input_and_culture_and_collate_input() {
+        let try_parse = Expr::TryParse {
+            expr: Box::new(Expr::Identifier(Ident::new("source_value"))),
+            data_type: DataType::Datetime(None),
+            culture: Some(Box::new(Expr::Identifier(Ident::new("culture_value")))),
+        };
+        let collate = Expr::Collate {
+            expr: Box::new(Expr::Identifier(Ident::new("collated_value"))),
+            collation: ObjectName::from(Ident::new("Latin1_General_100_CI_AS")),
+        };
+        let mut visited_identifiers = Vec::new();
+
+        visit_expr(&try_parse, &mut |expr| {
+            if let Expr::Identifier(identifier) = expr {
+                visited_identifiers.push(identifier.value.clone());
+            }
+        });
+        visit_expr(&collate, &mut |expr| {
+            if let Expr::Identifier(identifier) = expr {
+                visited_identifiers.push(identifier.value.clone());
+            }
+        });
+
+        assert!(visited_identifiers.contains(&"source_value".to_string()));
+        assert!(visited_identifiers.contains(&"culture_value".to_string()));
+        assert!(visited_identifiers.contains(&"collated_value".to_string()));
     }
 }

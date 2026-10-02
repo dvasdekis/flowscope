@@ -1,4 +1,4 @@
-use super::helpers::generate_output_node_id;
+use super::helpers::{generate_output_node_id, unquote_identifier};
 use crate::types::{Edge, FilterClauseType, FilterPredicate, JoinType, Node, NodeType, Span};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -33,6 +33,13 @@ pub(crate) struct RelationInstance {
     pub(crate) node_id: Arc<str>,
 }
 
+/// A declared column on an external rowset whose source lineage is not modeled.
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalRowsetColumn {
+    pub(crate) name: String,
+    pub(crate) data_type: Option<String>,
+}
+
 /// Represents a single scope level for column resolution.
 /// Each SELECT/subquery/CTE body gets its own scope.
 #[derive(Debug, Clone, Default)]
@@ -55,6 +62,9 @@ pub(crate) struct Scope {
     /// Scope-local output columns for subquery/CTE aliases materialized in this scope.
     /// These shadow statement-global CTE definitions when alias names are reused.
     pub(crate) subquery_columns: HashMap<String, Vec<OutputColumn>>,
+    /// Declared columns for external rowsets, kept separate from database relations
+    /// so they can inform query analysis without creating fictitious table lineage.
+    pub(crate) external_rowset_columns: HashMap<String, Vec<ExternalRowsetColumn>>,
     /// True when the scope contains a table function relation whose output
     /// columns may be dialect-provided rather than schema-backed.
     pub(crate) has_table_function_relation: bool,
@@ -663,6 +673,92 @@ impl StatementContext {
         }
     }
 
+    /// Register an external rowset alias and its declared output columns.
+    ///
+    /// External rowsets are visible to column and wildcard analysis but are not
+    /// registered as database relations, so they cannot produce table nodes or
+    /// source edges.
+    pub(crate) fn register_external_rowset_in_scope(
+        &mut self,
+        alias: String,
+        columns: Vec<ExternalRowsetColumn>,
+    ) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.subquery_aliases.insert(alias.clone());
+            scope.external_rowset_columns.insert(alias, columns);
+        }
+    }
+
+    /// Resolve declared external-rowset columns in lexical scope order.
+    pub(crate) fn external_rowset_columns(&self, alias: &str) -> Option<&[ExternalRowsetColumn]> {
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(columns) = scope.external_rowset_columns.get(alias).or_else(|| {
+                scope
+                    .external_rowset_columns
+                    .iter()
+                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(alias))
+                    .map(|(_, columns)| columns)
+            }) {
+                return Some(columns.as_slice());
+            }
+
+            let shadowed = scope
+                .aliases
+                .keys()
+                .any(|candidate| unquote_identifier(candidate).eq_ignore_ascii_case(alias))
+                || scope.subquery_aliases.iter().any(|candidate| {
+                    if scope.external_rowset_columns.contains_key(candidate) {
+                        candidate.eq_ignore_ascii_case(alias)
+                    } else {
+                        unquote_identifier(candidate).eq_ignore_ascii_case(alias)
+                    }
+                })
+                || scope
+                    .alias_instances
+                    .keys()
+                    .any(|candidate| unquote_identifier(candidate).eq_ignore_ascii_case(alias));
+            if shadowed {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Get declared external rowsets in the current scope.
+    pub(crate) fn external_rowsets_in_current_scope(
+        &self,
+    ) -> Vec<(String, Vec<ExternalRowsetColumn>)> {
+        self.current_scope()
+            .map(|scope| {
+                scope
+                    .external_rowset_columns
+                    .iter()
+                    .map(|(alias, columns)| (alias.clone(), columns.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns true when an unqualified reference may belong to an external rowset.
+    ///
+    /// A rowset without declared columns is opaque, so any unqualified name may
+    /// refer to it. A declared schema can rule out names absent from that schema.
+    pub(crate) fn external_rowset_may_contain_column(
+        &self,
+        column: &str,
+        normalize_identifier: impl Fn(&str) -> String,
+    ) -> bool {
+        let normalized_column = normalize_identifier(column);
+        self.current_scope().is_some_and(|scope| {
+            scope.external_rowset_columns.values().any(|columns| {
+                columns.is_empty()
+                    || columns
+                        .iter()
+                        .any(|candidate| normalize_identifier(&candidate.name) == normalized_column)
+            })
+        })
+    }
+
     /// Mark that the current scope contains a table function relation.
     pub(crate) fn mark_table_function_in_scope(&mut self) {
         if let Some(scope) = self.current_scope_mut() {
@@ -761,5 +857,69 @@ impl StatementContext {
             return Vec::new();
         }
         self.output_columns.split_off(checkpoint)
+    }
+}
+
+#[cfg(test)]
+mod external_rowset_scope_tests {
+    use super::StatementContext;
+
+    #[test]
+    fn nested_external_alias_does_not_leak_to_outer_scope() {
+        let mut ctx = StatementContext::new(0);
+        ctx.push_scope();
+        ctx.push_scope();
+        ctx.register_external_rowset_in_scope("foo".to_string(), Vec::new());
+        assert!(ctx.external_rowset_columns("foo").is_some());
+        ctx.pop_scope();
+
+        assert!(ctx.external_rowset_columns("foo").is_none());
+        assert!(!ctx.subquery_aliases.contains("foo"));
+    }
+
+    #[test]
+    fn quoted_inner_aliases_shadow_outer_external_rowsets() {
+        for alias in ["r", "[R]", "\"R\""] {
+            for kind in ["table", "subquery", "instance"] {
+                let mut ctx = StatementContext::new(0);
+                ctx.push_scope();
+                ctx.register_external_rowset_in_scope("r".to_string(), Vec::new());
+                ctx.push_scope();
+                match kind {
+                    "table" => {
+                        ctx.register_alias_in_scope(alias.to_string(), "synthetic".to_string())
+                    }
+                    "subquery" => ctx.register_subquery_alias_in_scope(alias.to_string()),
+                    "instance" => ctx.register_alias_instance(
+                        alias.to_string(),
+                        "synthetic".to_string(),
+                        std::sync::Arc::from("synthetic_node"),
+                    ),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    ctx.external_rowset_columns("r").is_none(),
+                    "{kind}: {alias}"
+                );
+                ctx.pop_scope();
+                assert!(
+                    ctx.external_rowset_columns("r").is_some(),
+                    "{kind}: {alias}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn external_alias_values_with_literal_delimiters_remain_distinct() {
+        let mut ctx = StatementContext::new(0);
+        ctx.push_scope();
+        ctx.register_external_rowset_in_scope("r".to_string(), Vec::new());
+        ctx.push_scope();
+        ctx.register_external_rowset_in_scope("[r]".to_string(), Vec::new());
+        assert!(ctx.external_rowset_columns("r").is_some());
+        assert!(ctx.external_rowset_columns("[r]").is_some());
+        ctx.pop_scope();
+        assert!(ctx.external_rowset_columns("[r]").is_none());
     }
 }

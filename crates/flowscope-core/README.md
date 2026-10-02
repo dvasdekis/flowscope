@@ -22,6 +22,24 @@ Core SQL lineage analysis engine for FlowScope.
 
 ## Structure
 
+### Parser dependency
+
+The engine uses `flowscope-sqlparser`, an Apache-2.0 fork of upstream sqlparser
+0.61.0 maintained in `vendor/sqlparser`. The fork adds a typed `Expr::TryParse`
+node so MSSQL input expressions, target types, and optional cultures are preserved
+without substituting different SQL semantics. It also maintains narrow MSSQL
+grammar support for right-nested joins with deferred conditions and complete
+table-column lists with a trailing comma. FlowScope-specific adapters live in
+the core engine; other dialects retain their existing behavior.
+
+Rust integrations that exchange parser ASTs must use this fork rather than
+upstream sqlparser's distinct Rust types. The dependency is aliased as `sqlparser`
+inside the workspace. The fork follows FlowScope's release version and must be
+published before `flowscope-core`; a workspace-only `[patch.crates-io]` is
+insufficient because Cargo does not carry it into published dependent packages.
+
+### Source layout
+
 ```text
 src/
 ├── analyzer.rs              # Main analysis orchestration

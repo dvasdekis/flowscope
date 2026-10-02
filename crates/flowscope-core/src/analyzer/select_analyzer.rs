@@ -235,9 +235,22 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     let qualifier = name.to_string();
                     // SelectItemQualifiedWildcardKind::Display appends ".*"
                     let qualifier = qualifier.strip_suffix(".*").unwrap_or(&qualifier);
+                    let external_alias = match name {
+                        ast::SelectItemQualifiedWildcardKind::ObjectName(object_name) => {
+                            match object_name.0.as_slice() {
+                                [ast::ObjectNamePart::Identifier(ident)]
+                                    if self.ctx.external_rowset_columns(&ident.value).is_some() =>
+                                {
+                                    Some(ident.value.as_str())
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
                     self.analyzer.expand_wildcard(
                         self.ctx,
-                        Some(qualifier),
+                        Some(external_alias.unwrap_or(qualifier)),
                         self.target_node.as_deref(),
                     );
                 }
@@ -409,12 +422,12 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
     /// Look up the data type of a column from CTE/subquery output columns or schema.
     ///
     /// Resolution priority:
-    /// 1. CTE/derived table output columns (for columns from CTEs or subqueries)
-    /// 2. Schema registry (for columns from base tables with user-provided or DDL-inferred schema)
+    /// 1. Declared external-rowset columns
+    /// 2. CTE/derived table output columns (for columns from CTEs or subqueries)
+    /// 3. Schema registry (for columns from base tables with user-provided or DDL-inferred schema)
     ///
-    /// When referencing columns from CTEs or derived tables, we can inherit the
-    /// type from the CTE's output column definition. This enables type propagation
-    /// through CTE chains even when the column is just a simple identifier reference.
+    /// When referencing columns from external rowsets, CTEs, or derived tables, we
+    /// can inherit declared types without treating the external file as a table node.
     ///
     /// For columns from base tables, we look up the type from the schema registry
     /// if the table and column exist there.
@@ -429,6 +442,16 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
 
         // If table is specified, resolve it. Otherwise, search all CTEs/subqueries in scope.
         if let Some(table) = source.table.as_ref() {
+            if let Some(columns) = self.ctx.external_rowset_columns(table) {
+                return columns
+                    .iter()
+                    .find(|column| {
+                        self.analyzer.normalize_identifier(&column.name) == normalized_col
+                    })
+                    .and_then(|column| column.data_type.as_deref())
+                    .map(normalize_schema_type);
+            }
+
             // Resolve alias to canonical name for CTE lookup
             let canonical = self.analyzer.resolve_table_alias(self.ctx, Some(table))?;
 
@@ -450,6 +473,34 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                 return Some(normalize_schema_type(&schema_type));
             }
         } else {
+            let external_matches: Vec<_> = self
+                .ctx
+                .external_rowsets_in_current_scope()
+                .into_iter()
+                .flat_map(|(_, columns)| columns)
+                .filter(|column| self.analyzer.normalize_identifier(&column.name) == normalized_col)
+                .collect();
+            if !external_matches.is_empty() {
+                if external_matches.len() == 1
+                    && self.ctx.relation_instances_in_current_scope().is_empty()
+                {
+                    return external_matches[0]
+                        .data_type
+                        .as_deref()
+                        .map(normalize_schema_type);
+                }
+                return None;
+            }
+
+            if self
+                .ctx
+                .external_rowsets_in_current_scope()
+                .iter()
+                .any(|(_, columns)| columns.is_empty())
+            {
+                return None;
+            }
+
             // No table qualifier - search all CTEs/subqueries in current scope
             for table_canonical in self.ctx.tables_in_current_scope() {
                 // Check CTE/subquery columns first

@@ -223,7 +223,9 @@ fn extract_tables_from_expr(expr: &sqlparser::ast::Expr, tables: &mut Vec<String
                 }
             }
         }
-        Expr::Nested(inner) => extract_tables_from_expr(inner, tables),
+        Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => {
+            extract_tables_from_expr(inner, tables)
+        }
         Expr::Subquery(query) => extract_tables_from_query_body(&query.body, tables),
         Expr::BinaryOp { left, right, .. } => {
             extract_tables_from_expr(left, tables);
@@ -231,6 +233,12 @@ fn extract_tables_from_expr(expr: &sqlparser::ast::Expr, tables: &mut Vec<String
         }
         Expr::UnaryOp { expr, .. } => extract_tables_from_expr(expr, tables),
         Expr::Cast { expr, .. } => extract_tables_from_expr(expr, tables),
+        Expr::TryParse { expr, culture, .. } => {
+            extract_tables_from_expr(expr, tables);
+            if let Some(culture) = culture {
+                extract_tables_from_expr(culture, tables);
+            }
+        }
         Expr::Extract { expr, .. } => extract_tables_from_expr(expr, tables),
         Expr::Case {
             operand,

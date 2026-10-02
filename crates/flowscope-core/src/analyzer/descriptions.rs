@@ -18,7 +18,7 @@ use sqlparser::ast::{
     SqlOption, Statement,
 };
 
-use super::input::StatementInput;
+use super::input::{StatementInput, StatementInputKind};
 use super::Analyzer;
 use crate::types::{Edge, EdgeType, Node, NodeType};
 
@@ -60,7 +60,10 @@ impl<'a> Analyzer<'a> {
         let mut map: HashMap<DescriptionKey, Arc<str>> = HashMap::new();
 
         for input in statements {
-            match &input.statement {
+            let StatementInputKind::Parsed(statement) = &input.statement else {
+                continue;
+            };
+            match statement.as_ref() {
                 Statement::Comment {
                     object_type,
                     object_name,

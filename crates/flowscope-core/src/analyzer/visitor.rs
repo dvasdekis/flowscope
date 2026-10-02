@@ -4,7 +4,7 @@
 //! and building lineage graphs. It separates traversal logic (the `Visitor` trait)
 //! from analysis logic (the `LineageVisitor` implementation).
 
-use super::context::StatementContext;
+use super::context::{ExternalRowsetColumn, StatementContext};
 use super::expression::ExpressionAnalyzer;
 use super::helpers::{
     alias_visibility_warning, find_cte_body_span, find_cte_definition_span,
@@ -325,6 +325,10 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
     }
 
     pub fn analyze_dml_target_factor(&mut self, table: &TableFactor) -> Option<Arc<str>> {
+        if self.is_synapse_openrowset_table_factor(table) {
+            self.visit_table_factor(table);
+            return None;
+        }
         if let TableFactor::Table { name, alias, .. } = table {
             let table_name = name.to_string();
             self.analyze_dml_target(&table_name, alias.as_ref())
@@ -339,6 +343,10 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
         &mut self,
         table: &TableWithJoins,
     ) -> Option<Arc<str>> {
+        if self.is_synapse_openrowset_table_factor(&table.relation) {
+            self.visit_table_with_joins(table);
+            return None;
+        }
         if let TableFactor::Table { name, alias, .. } = &table.relation {
             let table_name = name.to_string();
             self.analyze_dml_target(&table_name, alias.as_ref())
@@ -358,6 +366,11 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
 
     fn register_aliases_in_table_factor(&mut self, table_factor: &TableFactor) {
         match table_factor {
+            TableFactor::Table {
+                alias: Some(alias), ..
+            } if self.is_synapse_openrowset_table_factor(table_factor) => {
+                self.register_synapse_openrowset_alias(alias);
+            }
             TableFactor::Table {
                 name,
                 alias: Some(a),
@@ -379,6 +392,44 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
             }
             _ => {}
         }
+    }
+
+    fn is_synapse_openrowset_table_factor(&self, table_factor: &TableFactor) -> bool {
+        let TableFactor::Table {
+            name,
+            args: Some(args),
+            ..
+        } = table_factor
+        else {
+            return false;
+        };
+        if !matches!(self.analyzer.request.dialect, crate::types::Dialect::Mssql)
+            || !name.to_string().eq_ignore_ascii_case("OPENROWSET")
+        {
+            return false;
+        }
+
+        matches!(
+            args.args.first(),
+            Some(ast::FunctionArg::ExprNamed {
+                name: Expr::Identifier(argument_name),
+                operator: ast::FunctionArgOperator::Colon,
+                ..
+            }) if argument_name.value.eq_ignore_ascii_case("BULK")
+        )
+    }
+
+    fn register_synapse_openrowset_alias(&mut self, alias: &TableAlias) {
+        let columns = alias
+            .columns
+            .iter()
+            .map(|column| ExternalRowsetColumn {
+                name: column.name.to_string(),
+                data_type: column.data_type.as_ref().map(ToString::to_string),
+            })
+            .collect();
+        self.ctx
+            .register_external_rowset_in_scope(alias.name.value.clone(), columns);
     }
 
     pub fn resolve_table_alias(&self, alias: Option<&str>) -> Option<String> {
@@ -658,6 +709,26 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
 
     fn visit_table_factor(&mut self, table_factor: &TableFactor) {
         match table_factor {
+            TableFactor::Table { name, alias, .. }
+                if self.is_synapse_openrowset_table_factor(table_factor) =>
+            {
+                if let Some(alias) = alias {
+                    self.register_synapse_openrowset_alias(alias);
+                }
+                self.ctx.mark_table_function_in_scope();
+                let mut issue = Issue::warning(
+                    issue_codes::UNSUPPORTED_SYNTAX,
+                    "Synapse OPENROWSET parsed, but external-file lineage is not modeled",
+                )
+                .with_statement(self.ctx.statement_index);
+                if let Some(span) = self
+                    .analyzer
+                    .locate_relation_name_span(self.ctx, &name.to_string())
+                {
+                    issue = issue.with_span(span);
+                }
+                self.analyzer.issues.push(issue);
+            }
             TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
                 let alias_str = alias.as_ref().map(|a| a.name.to_string());

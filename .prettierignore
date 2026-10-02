@@ -5,3 +5,6 @@ packages/core/wasm/flowscope_wasm.js
 packages/core/wasm/flowscope_wasm.d.ts
 app/public/wasm/flowscope_wasm.js
 app/public/wasm/flowscope_wasm.d.ts
+
+# Preserve the upstream dependency-vendoring checksum metadata.
+vendor/sqlparser/.cargo-checksum.json

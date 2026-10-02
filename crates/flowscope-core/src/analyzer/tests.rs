@@ -60,6 +60,27 @@ fn analyze_rejects_oversized_inline_sql_before_templating_or_parsing() {
 }
 
 #[test]
+fn split_statements_reports_mssql_repeat_expansion_limit() {
+    let mut sql = String::new();
+    for _ in 0..=crate::analyzer::input::MAX_MSSQL_EXPANDED_STATEMENT_RANGES
+        / crate::analyzer::input::MAX_MSSQL_GO_REPEAT
+    {
+        sql.push_str("SELECT 1;\nGO 1000\n");
+    }
+
+    let result = split_statements(&StatementSplitRequest {
+        sql,
+        dialect: Dialect::Mssql,
+    });
+
+    assert!(result.statements.is_empty());
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|message| message.contains("batch expansion limit")));
+}
+
+#[test]
 fn analyze_uses_utf8_bytes_for_inline_size_limit() {
     let sql = "é".repeat(MAX_ANALYSIS_SOURCE_BYTES / "é".len() + 1);
     assert!(sql.chars().count() < MAX_ANALYSIS_SOURCE_BYTES);
@@ -451,6 +472,539 @@ fn parser_fallback_metadata_is_attached_to_lint_issues() {
         st012_issue.lint_fallback_source,
         Some(LintFallbackSource::ParserFallback),
         "lint issue should report parser fallback provenance"
+    );
+}
+
+#[test]
+fn synapse_openrowset_keeps_file_provenance_and_source_spans() {
+    let sql = format!(
+        "-- café\r\n{}",
+        concat!(
+            "SELECT file.id FROM OPENROWSET(",
+            "BULK 'https://storage.example/container/*.parquet', ",
+            "DATA_SOURCE = 'lake', FORMAT = 'PARQUET'",
+            ") AS file"
+        )
+    );
+    let mut request = make_request("");
+    request.dialect = Dialect::Mssql;
+    request.files = Some(vec![FileSource {
+        name: "synapse.sql".to_string(),
+        content: sql.to_string(),
+    }]);
+
+    let result = analyze(&request);
+
+    assert_eq!(result.statements.len(), 1);
+    assert_eq!(
+        result.statements[0].source_name.as_deref(),
+        Some("synapse.sql")
+    );
+    assert_eq!(
+        result.statements[0].span,
+        Some(Span::new(
+            sql.find("SELECT").expect("statement start"),
+            sql.len()
+        )),
+        "statement spans must refer to original source bytes"
+    );
+    assert!(!result.issues.iter().any(|issue| {
+        issue.code == issue_codes::PARSE_ERROR && issue.severity == crate::types::Severity::Error
+    }));
+
+    assert!(
+        result
+            .nodes_in_statement(0)
+            .all(|node| node.node_type != NodeType::Table),
+        "external-file OPENROWSET must not create a fictitious database table node"
+    );
+    assert!(
+        result
+            .edges_in_statement(0)
+            .all(|edge| edge.edge_type != EdgeType::DataFlow),
+        "external-file OPENROWSET must not produce unsupported dataflow edges"
+    );
+    let lineage_issue = result
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.code == issue_codes::UNSUPPORTED_SYNTAX
+                && issue
+                    .message
+                    .contains("external-file lineage is not modeled")
+        })
+        .expect("explicit unsupported-lineage diagnostic");
+    assert_eq!(lineage_issue.severity, crate::types::Severity::Warning);
+    assert_eq!(lineage_issue.source_name.as_deref(), Some("synapse.sql"));
+    let rowset_offset = sql.find("OPENROWSET").expect("OPENROWSET source token");
+    assert_eq!(
+        lineage_issue.span,
+        Some(Span::new(rowset_offset, rowset_offset + "OPENROWSET".len()))
+    );
+}
+
+#[test]
+fn synapse_openrowset_parenthesized_bulk_list_preserves_lineage_and_go_spans() {
+    let sql = concat!(
+        "-- café\r\n",
+        "CREATE OR ALTER VIEW dbo.demo_rows AS ",
+        "SELECT * FROM OPENROWSET(",
+        "BULK ('data/a.parquet', 'data/b.parquet'), FORMAT = 'PARQUET'",
+        ") AS src;\r\n",
+        "GO\r\n",
+        "SELECT 1 AS later;"
+    );
+    let mut request = make_request("");
+    request.dialect = Dialect::Mssql;
+    request.files = Some(vec![FileSource {
+        name: "synapse-list.sql".to_string(),
+        content: sql.to_string(),
+    }]);
+
+    let result = analyze(&request);
+
+    assert_eq!(result.statements.len(), 2);
+    assert!(result
+        .issues
+        .iter()
+        .all(|issue| issue.code != issue_codes::PARSE_ERROR));
+    assert!(result
+        .statements
+        .iter()
+        .all(|statement| statement.source_name.as_deref() == Some("synapse-list.sql")));
+
+    let view_span = result.statements[0]
+        .span
+        .expect("view source span should be present");
+    let view_source = &sql[view_span.start..view_span.end];
+    assert!(view_source.starts_with("CREATE OR ALTER VIEW dbo.demo_rows"));
+    assert!(view_source.contains("BULK ('data/a.parquet', 'data/b.parquet')"));
+    assert!(
+        result.nodes_in_statement(0).all(|node| {
+            node.node_type != NodeType::Table
+                || (!node.label.as_ref().eq_ignore_ascii_case("OPENROWSET")
+                    && !node.label.as_ref().contains("data/a.parquet")
+                    && !node.label.as_ref().contains("data/b.parquet"))
+        }),
+        "external paths or the OPENROWSET function must not become fictitious table nodes"
+    );
+    assert!(
+        result
+            .edges_in_statement(0)
+            .all(|edge| edge.edge_type != EdgeType::DataFlow),
+        "external file-list sources must not produce unsupported dataflow edges"
+    );
+
+    let lineage_issue = result
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.code == issue_codes::UNSUPPORTED_SYNTAX
+                && issue
+                    .message
+                    .contains("external-file lineage is not modeled")
+        })
+        .expect("external rowset should retain its unsupported-lineage warning");
+    assert_eq!(lineage_issue.severity, crate::types::Severity::Warning);
+    let warning_span = lineage_issue.span.expect("warning source span");
+    assert_eq!(
+        &sql[warning_span.start..warning_span.end],
+        "OPENROWSET",
+        "the warning should point into the original UTF-8 SQL buffer"
+    );
+    assert_eq!(
+        lineage_issue.source_name.as_deref(),
+        Some("synapse-list.sql")
+    );
+
+    let later_span = result.statements[1]
+        .span
+        .expect("post-GO statement span should be present");
+    assert_eq!(
+        &sql[later_span.start..later_span.end],
+        "SELECT 1 AS later",
+        "GO splitting should preserve the original source range"
+    );
+}
+
+#[test]
+fn synapse_openrowset_declared_columns_support_alias_reference_without_external_nodes() {
+    let sql = concat!(
+        "SELECT SRC.order_id, SRC.customer_name FROM OPENROWSET(",
+        "BULK 'https://storage.example/container/*.csv', FORMAT = 'CSV'",
+        ") WITH (order_id BIGINT 1, customer_name VARCHAR(128) '$.customerName') AS src"
+    );
+    let mut request = make_request("");
+    request.dialect = Dialect::Mssql;
+    request.files = Some(vec![FileSource {
+        name: "synapse-schema.sql".to_string(),
+        content: sql.to_owned(),
+    }]);
+
+    let result = analyze(&request);
+
+    assert_eq!(result.statements.len(), 1);
+    assert!(
+        !result
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::PARSE_ERROR),
+        "schema-bearing OPENROWSET must parse: {:?}",
+        result.issues
+    );
+    assert!(
+        result
+            .nodes_in_statement(0)
+            .all(|node| node.node_type != NodeType::Table),
+        "declared file schema must not become a database table node"
+    );
+    assert!(
+        result.nodes_in_statement(0).any(|node| {
+            node.node_type == NodeType::Column && node.label.as_ref() == "order_id"
+        }),
+        "qualified declared column aliases must participate in SELECT analysis"
+    );
+    assert!(result.nodes_in_statement(0).any(|node| {
+        node.node_type == NodeType::Column && node.label.as_ref() == "customer_name"
+    }));
+    let order_id = result
+        .nodes_in_statement(0)
+        .find(|node| node.node_type == NodeType::Column && node.label.as_ref() == "order_id")
+        .expect("declared output column");
+    let order_id_type = order_id
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("data_type"))
+        .and_then(|data_type| data_type.as_str());
+    assert_eq!(
+        order_id_type,
+        Some("INTEGER"),
+        "declared OPENROWSET types must inform output type analysis"
+    );
+    assert!(
+        result
+            .edges_in_statement(0)
+            .all(|edge| edge.edge_type != EdgeType::DataFlow),
+        "external file columns must not create fictitious source edges"
+    );
+    assert!(!result
+        .issues
+        .iter()
+        .any(|issue| issue.code == issue_codes::UNKNOWN_COLUMN));
+    let lineage_issue = result
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.code == issue_codes::UNSUPPORTED_SYNTAX
+                && issue
+                    .message
+                    .contains("external-file lineage is not modeled")
+        })
+        .expect("explicit unsupported-lineage diagnostic");
+    let span = lineage_issue.span.expect("diagnostic source span");
+    assert_eq!(
+        &sql[span.start..span.end],
+        "OPENROWSET",
+        "diagnostic span must point at the source construct"
+    );
+    assert_eq!(
+        lineage_issue.source_name.as_deref(),
+        Some("synapse-schema.sql")
+    );
+}
+
+#[test]
+fn synapse_openrowset_unqualified_declared_column_uses_schema_without_source_edge() {
+    let sql = concat!(
+        "SELECT order_id FROM OPENROWSET(",
+        "BULK 'https://storage.example/container/orders.parquet', FORMAT = 'PARQUET'",
+        ") WITH (order_id BIGINT) AS orders"
+    );
+    let mut request = make_request("");
+    request.dialect = Dialect::Mssql;
+    request.files = Some(vec![FileSource {
+        name: "synapse-unqualified.sql".to_string(),
+        content: sql.to_owned(),
+    }]);
+
+    let result = analyze(&request);
+
+    assert!(
+        result.nodes_in_statement(0).any(|node| {
+            node.node_type == NodeType::Column
+                && node.label.as_ref() == "order_id"
+                && node.metadata.as_ref().is_some_and(|metadata| {
+                    metadata
+                        .get("data_type")
+                        .and_then(|data_type| data_type.as_str())
+                        == Some("INTEGER")
+                })
+        }),
+        "unqualified declared columns and their types must be available to SELECT analysis"
+    );
+    assert!(result
+        .nodes_in_statement(0)
+        .all(|node| node.node_type != NodeType::Table));
+    assert!(result
+        .edges_in_statement(0)
+        .all(|edge| edge.edge_type != EdgeType::DataFlow));
+    assert!(!result.issues.iter().any(|issue| {
+        issue.code == issue_codes::UNRESOLVED_REFERENCE || issue.code == issue_codes::PARSE_ERROR
+    }));
+}
+
+#[test]
+fn synapse_openrowset_declared_schema_expands_alias_wildcard_without_external_lineage() {
+    let sql = concat!(
+        "SELECT orders.* FROM OPENROWSET(",
+        "BULK 'https://storage.example/container/orders.parquet', FORMAT = 'PARQUET'",
+        ") WITH (order_id BIGINT, customer_name VARCHAR(128)) AS orders"
+    );
+    let mut request = make_request("");
+    request.dialect = Dialect::Mssql;
+    request.files = Some(vec![FileSource {
+        name: "synapse-wildcard.sql".to_string(),
+        content: sql.to_owned(),
+    }]);
+
+    let result = analyze(&request);
+
+    for column in ["order_id", "customer_name"] {
+        assert!(
+            result.nodes_in_statement(0).any(|node| {
+                node.node_type == NodeType::Column && node.label.as_ref() == column
+            }),
+            "declared wildcard column '{column}' should be expanded"
+        );
+    }
+    assert!(result
+        .nodes_in_statement(0)
+        .all(|node| node.node_type != NodeType::Table));
+    assert!(result
+        .edges_in_statement(0)
+        .all(|edge| edge.edge_type != EdgeType::DataFlow));
+}
+
+#[test]
+fn synapse_openrowset_quoted_alias_preserves_types_without_external_lineage() {
+    for (alias, reference) in [
+        ("r", "r"),
+        ("[r]", "[r]"),
+        ("\"r\"", "\"r\""),
+        ("[R]", "r"),
+        ("r", "[R]"),
+        ("[row set]", "[row set]"),
+        ("[row.set]", "[row.set]"),
+        ("[[r]]]", "[[r]]]"),
+    ] {
+        for projection in [
+            format!("{reference}.id, {reference}.customer_name"),
+            format!("{reference}.*"),
+            "*".to_string(),
+        ] {
+            let sql = format!(
+                "SELECT {projection} FROM OPENROWSET(BULK 'demo.parquet', FORMAT = 'PARQUET') \
+                 WITH (id INT, customer_name VARCHAR(32)) AS {alias}"
+            );
+            let mut request = make_request(&sql);
+            request.dialect = Dialect::Mssql;
+            let result = analyze(&request);
+
+            assert_eq!(result.statements.len(), 1, "{sql}");
+            assert!(
+                !result.issues.iter().any(|issue| {
+                    issue.code == issue_codes::PARSE_ERROR
+                        || issue.code == issue_codes::UNKNOWN_COLUMN
+                        || issue.code == issue_codes::UNRESOLVED_REFERENCE
+                }),
+                "{sql}: {:?}",
+                result.issues
+            );
+            assert!(
+                result.issues.iter().any(|issue| {
+                    issue.code == issue_codes::UNSUPPORTED_SYNTAX
+                        && issue
+                            .message
+                            .contains("external-file lineage is not modeled")
+                }),
+                "{sql}"
+            );
+            assert!(
+                result.nodes_in_statement(0).all(|node| {
+                    node.node_type != NodeType::Table && node.qualified_name.is_none()
+                }),
+                "{sql}: {:?}",
+                result.nodes
+            );
+            assert!(
+                result
+                    .edges_in_statement(0)
+                    .all(|edge| { edge.edge_type != EdgeType::DataFlow }),
+                "{sql}"
+            );
+            assert!(
+                result
+                    .resolved_schema
+                    .as_ref()
+                    .is_none_or(|schema| { schema.tables.is_empty() }),
+                "{sql}"
+            );
+
+            let columns: Vec<_> = result
+                .nodes_in_statement(0)
+                .filter(|node| node.node_type == NodeType::Column)
+                .collect();
+            assert_eq!(columns.len(), 2, "{sql}: {columns:?}");
+            for (name, data_type) in [("id", "INTEGER"), ("customer_name", "VARCHAR(32)")] {
+                let column = columns
+                    .iter()
+                    .find(|column| column.label.as_ref() == name)
+                    .unwrap_or_else(|| panic!("{sql}: missing {name}"));
+                assert_eq!(
+                    column
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("data_type"))
+                        .and_then(|value| value.as_str()),
+                    Some(data_type),
+                    "{sql}: {name}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn synapse_openrowset_quoted_alias_reports_unknown_column_without_external_lineage() {
+    for alias in ["[r]", "\"r\""] {
+        let sql = format!(
+            "SELECT {alias}.id FROM OPENROWSET(BULK 'demo.parquet', FORMAT = 'PARQUET') \
+             WITH (id INT) AS {alias} WHERE {alias}.missing_column > 0"
+        );
+        let mut request = make_request(&sql);
+        request.dialect = Dialect::Mssql;
+        let result = analyze(&request);
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::PARSE_ERROR));
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.code == issue_codes::UNKNOWN_COLUMN
+                    && issue.message.contains("external OPENROWSET alias 'r'")
+            }),
+            "{sql}: {:?}",
+            result.issues
+        );
+        assert!(result
+            .edges_in_statement(0)
+            .all(|edge| edge.edge_type != EdgeType::DataFlow));
+        assert!(result
+            .resolved_schema
+            .as_ref()
+            .is_none_or(|schema| schema.tables.is_empty()));
+    }
+}
+
+#[test]
+fn synapse_openrowset_declared_schema_reports_unknown_qualified_columns() {
+    let sql = concat!(
+        "SELECT src.order_id FROM OPENROWSET(",
+        "BULK 'https://storage.example/container/orders.parquet', FORMAT = 'PARQUET'",
+        ") WITH (order_id BIGINT) AS src WHERE src.missing_column > 0"
+    );
+    let mut request = make_request("");
+    request.dialect = Dialect::Mssql;
+    request.files = Some(vec![FileSource {
+        name: "synapse-unknown-column.sql".to_string(),
+        content: sql.to_owned(),
+    }]);
+
+    let result = analyze(&request);
+
+    let unknown_column = result
+        .issues
+        .iter()
+        .find(|issue| issue.code == issue_codes::UNKNOWN_COLUMN)
+        .expect("declared rowset schemas should validate qualified columns");
+    assert!(unknown_column
+        .message
+        .contains("external OPENROWSET alias 'src'"));
+    assert!(result
+        .nodes_in_statement(0)
+        .all(|node| node.node_type != NodeType::Table));
+    assert!(result
+        .edges_in_statement(0)
+        .all(|edge| edge.edge_type != EdgeType::DataFlow));
+}
+
+#[test]
+fn nested_openrowset_alias_does_not_shadow_outer_table() {
+    let sql = concat!(
+        "SELECT foo.id FROM foo CROSS JOIN ",
+        "(SELECT 1 FROM OPENROWSET(BULK 'path', FORMAT = 'CSV') AS foo) AS d"
+    );
+    let mut request = make_request(sql);
+    request.dialect = Dialect::Mssql;
+    let result = analyze(&request);
+
+    assert_eq!(result.statements.len(), 1);
+    assert!(!result
+        .issues
+        .iter()
+        .any(|issue| issue.code == issue_codes::PARSE_ERROR));
+    assert!(result
+        .nodes_in_statement(0)
+        .any(|node| node.node_type == NodeType::Table && node.label.as_ref() == "foo"));
+    assert!(result
+        .nodes_in_statement(0)
+        .any(|node| node.node_type == NodeType::Column && node.label.as_ref() == "id"));
+}
+
+#[test]
+fn synapse_openrowset_with_invalid_schema_keeps_local_parse_diagnostic() {
+    let invalid_statement = concat!(
+        "SELECT * FROM OPENROWSET(",
+        "BULK 'https://storage.example/container/*.parquet', FORMAT = 'PARQUET'",
+        ") WITH () AS file"
+    );
+    let sql = format!("{invalid_statement};\nSELECT 1 FROM valid_table;");
+    let mut request = make_request("");
+    request.dialect = Dialect::Mssql;
+    request.files = Some(vec![FileSource {
+        name: "synapse-schema.sql".to_string(),
+        content: sql.clone(),
+    }]);
+
+    let result = analyze(&request);
+    let parse_error = result
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.code == issue_codes::PARSE_ERROR
+                && issue.severity == crate::types::Severity::Error
+        })
+        .expect("malformed schema syntax must remain a parse error");
+    let span = parse_error.span.expect("parse error span");
+
+    assert_eq!(
+        &sql[span.start..span.end],
+        invalid_statement,
+        "diagnostic span must identify the original OPENROWSET statement"
+    );
+    assert_eq!(
+        parse_error.source_name.as_deref(),
+        Some("synapse-schema.sql")
+    );
+    assert_eq!(
+        result.statements.len(),
+        1,
+        "later statements should recover"
+    );
+    let recovered_span = result.statements[0].span.expect("recovered statement span");
+    assert_eq!(
+        &sql[recovered_span.start..recovered_span.end],
+        "SELECT 1 FROM valid_table"
     );
 }
 

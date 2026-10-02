@@ -556,6 +556,14 @@ impl<'a> Analyzer<'a> {
         table_qualifier: Option<&str>,
         target_node: Option<&str>,
     ) {
+        let external_rowsets_to_expand = if let Some(qualifier) = table_qualifier {
+            ctx.external_rowset_columns(qualifier)
+                .map(|columns| vec![(qualifier.to_string(), columns.to_vec())])
+                .unwrap_or_default()
+        } else {
+            ctx.external_rowsets_in_current_scope()
+        };
+
         // Resolve wildcard sources as (canonical, qualifier) pairs so repeated
         // relation instances in self-joins are expanded independently.
         let tables_to_expand: Vec<(String, String)> = if let Some(qualifier) = table_qualifier {
@@ -686,6 +694,28 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
+
+        for (source_qualifier, columns) in external_rowsets_to_expand {
+            for column in columns {
+                let data_type = column
+                    .data_type
+                    .as_ref()
+                    .map(|data_type| normalize_schema_type(data_type));
+                let column_name = column.name;
+                self.add_output_column(
+                    ctx,
+                    &column_name,
+                    vec![ColumnRef {
+                        table: Some(source_qualifier.clone()),
+                        column: column_name.clone(),
+                    }],
+                    None,
+                    data_type,
+                    target_node,
+                    false,
+                );
+            }
+        }
     }
 
     pub(super) fn resolve_table_alias(
@@ -695,6 +725,10 @@ impl<'a> Analyzer<'a> {
     ) -> Option<String> {
         match qualifier {
             Some(q) => {
+                if ctx.external_rowset_columns(q).is_some() {
+                    return None;
+                }
+
                 // Check scopes in reverse order (innermost first) for correct shadowing
                 for scope in ctx.scope_stack.iter().rev() {
                     if let Some(canonical) = scope.aliases.get(q) {
@@ -784,6 +818,12 @@ impl<'a> Analyzer<'a> {
             return self.resolve_table_alias(ctx, Some(q));
         }
 
+        if ctx.external_rowset_may_contain_column(column, |candidate| {
+            self.normalize_identifier(candidate)
+        }) {
+            return None;
+        }
+
         let relation_instances = ctx.relation_instances_in_current_scope();
         if relation_instances.is_empty() {
             return None;
@@ -810,6 +850,12 @@ impl<'a> Analyzer<'a> {
         // If qualifier provided, use standard resolution
         if let Some(q) = qualifier {
             return self.resolve_table_alias(ctx, Some(q));
+        }
+
+        if ctx.external_rowset_may_contain_column(column, |candidate| {
+            self.normalize_identifier(candidate)
+        }) {
+            return None;
         }
 
         // No qualifier - try to find which table owns this column

@@ -1,3 +1,4 @@
+use crate::error::ParseError;
 use crate::linter::document::{LintDocument, LintStatement};
 use crate::linter::Linter;
 use crate::types::*;
@@ -20,6 +21,7 @@ mod ddl;
 mod descriptions;
 mod diagnostics;
 mod expression;
+mod external_metadata;
 mod functions;
 mod global;
 pub mod helpers;
@@ -37,7 +39,9 @@ use descriptions::DescriptionKey;
 use helpers::{
     build_column_schemas_with_constraints, find_identifier_span, find_relation_occurrence_spans,
 };
-use input::{collect_statements, validate_analysis_input_sizes, StatementInput};
+use input::{
+    collect_statements, validate_analysis_input_sizes, StatementInput, StatementInputKind,
+};
 use schema_registry::SchemaRegistry;
 use statements::{
     detect_dbt_model_materialization, extract_model_name, DbtMaterializationDetection,
@@ -75,9 +79,133 @@ pub fn split_statements(request: &StatementSplitRequest) -> StatementSplitResult
         ));
     }
 
-    StatementSplitResult {
-        statements: input::split_statement_spans_with_dialect(&request.sql, request.dialect),
-        error: None,
+    match input::split_statement_spans_with_dialect(&request.sql, request.dialect) {
+        Ok(statements) => StatementSplitResult {
+            statements,
+            error: None,
+        },
+        Err(()) => StatementSplitResult::from_error(
+            "SQL input exceeds the supported MSSQL batch expansion limit",
+        ),
+    }
+}
+
+/// Parse-only summary returned by [`parse_only_sql_with_dialect_output`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseOnlyOutput {
+    /// Number of SQL or validated metadata statements parsed.
+    pub statement_count: usize,
+    /// Whether a dialect-specific parser compatibility adapter was used.
+    pub parser_fallback_used: bool,
+}
+
+/// Parse SQL with the same input adapters used by analysis, without running analysis or lint.
+///
+/// Supported MSSQL external metadata statements each contribute one to
+/// `statement_count`, even though they do not produce a SQL AST node.
+pub fn parse_only_sql_with_dialect_output(
+    sql: &str,
+    dialect: Dialect,
+) -> Result<ParseOnlyOutput, ParseError> {
+    if matches!(dialect, Dialect::Mssql) {
+        if let Ok(statement_ranges) = input::mssql_statement_ranges_without_go(sql) {
+            if input::mssql_ranges_have_optional_separators(sql, &statement_ranges) {
+                return parse_only_statement_ranges(sql, statement_ranges, dialect);
+            }
+        }
+    }
+
+    match input::parse_input_statement_with_dialect_output(sql, dialect) {
+        Ok(output) => Ok(parse_only_output_summary(output)),
+        Err(error) => {
+            let primary_error = error.into_parse_error();
+            if !matches!(dialect, Dialect::Mssql) {
+                return Err(primary_error);
+            }
+
+            let Ok(statement_ranges) = input::mssql_statement_ranges_without_go(sql) else {
+                return Err(primary_error);
+            };
+            if !input::statement_ranges_contain_external_metadata(sql, &statement_ranges) {
+                return Err(primary_error);
+            }
+
+            parse_only_statement_ranges(sql, statement_ranges, dialect)
+        }
+    }
+}
+
+fn parse_only_statement_ranges(
+    sql: &str,
+    statement_ranges: Vec<std::ops::Range<usize>>,
+    dialect: Dialect,
+) -> Result<ParseOnlyOutput, ParseError> {
+    let mut summary = ParseOnlyOutput {
+        statement_count: 0,
+        parser_fallback_used: false,
+    };
+    let mut first_error = None;
+    for range in statement_ranges {
+        let statement_sql = sql.get(range.clone()).ok_or_else(|| {
+            ParseError::new("Could not read MSSQL statement source range")
+                .with_dialect(dialect)
+                .with_kind(crate::error::ParseErrorKind::SyntaxError)
+        })?;
+        match input::parse_input_statement_with_dialect_output(statement_sql, dialect) {
+            Ok(output) => {
+                let next = parse_only_output_summary(output);
+                summary.statement_count += next.statement_count;
+                summary.parser_fallback_used |= next.parser_fallback_used;
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(map_parse_error_from_statement_range(
+                        sql,
+                        statement_sql,
+                        range.start,
+                        error.into_parse_error(),
+                    ));
+                }
+            }
+        }
+    }
+
+    first_error.map_or(Ok(summary), Err)
+}
+
+fn map_parse_error_from_statement_range(
+    source_sql: &str,
+    statement_sql: &str,
+    statement_offset: usize,
+    mut error: ParseError,
+) -> ParseError {
+    if let Some(position) = error.position {
+        if let Some(relative_offset) =
+            helpers::line_col_to_offset(statement_sql, position.line, position.column)
+        {
+            if let Some(source_position) =
+                input::offset_to_position(source_sql, statement_offset + relative_offset)
+            {
+                error.position = Some(source_position);
+                if let Some(message_position) = error.message.rfind(" at Line:") {
+                    error.message.truncate(message_position);
+                }
+            }
+        }
+    }
+    error
+}
+
+fn parse_only_output_summary(output: input::InputParseOutput) -> ParseOnlyOutput {
+    match output {
+        input::InputParseOutput::ParsedSql(output) => ParseOnlyOutput {
+            statement_count: output.statements.len(),
+            parser_fallback_used: output.parser_fallback_used,
+        },
+        input::InputParseOutput::ExternalMetadata(_, parser_fallback_used) => ParseOnlyOutput {
+            statement_count: 1,
+            parser_fallback_used,
+        },
     }
 }
 
@@ -349,6 +477,35 @@ impl<'a> Analyzer<'a> {
                     .as_ref()
                     .and_then(|range| sql.get(range.clone()).map(str::to_string))
             });
+
+            let statement = match statement {
+                StatementInputKind::Parsed(statement) => *statement,
+                StatementInputKind::ExternalMetadata(metadata) => {
+                    let source_span = source_range_untemplated.as_ref().unwrap_or(&source_range);
+                    let span = Span::new(source_span.start, source_span.end);
+                    let mut issue = metadata
+                        .unsupported_lineage_warning()
+                        .with_statement(index)
+                        .with_span(span);
+                    if let Some(name) = source_name.as_deref() {
+                        issue = issue.with_source_name(name.as_str());
+                    }
+                    self.issues.push(issue);
+                    self.statement_lineages.push(StatementLineage {
+                        statement_index: index,
+                        statement_type: metadata.statement_type().to_string(),
+                        source_name: source_name.as_deref().map(ToString::to_string),
+                        nodes: Vec::new(),
+                        edges: Vec::new(),
+                        span: Some(Span::new(source_span.start, source_span.end)),
+                        join_count: 0,
+                        complexity_score: 1,
+                        resolved_sql,
+                    });
+                    continue;
+                }
+            };
+
             self.current_statement_source = Some(StatementSourceSlice {
                 sql: source_sql,
                 range: source_range.clone(),
@@ -419,13 +576,21 @@ impl<'a> Analyzer<'a> {
 
             let mut lint_statements = Vec::with_capacity(end - start);
             let mut source_statement_ranges = Vec::with_capacity(end - start);
+            let mut lint_statement_indices = Vec::with_capacity(end - start);
             for (offset, statement_input) in statements[start..end].iter().enumerate() {
-                lint_statements.push(LintStatement {
-                    statement: &statement_input.statement,
-                    statement_index: offset,
-                    statement_range: statement_input.source_range.clone(),
-                });
-                source_statement_ranges.push(statement_input.source_range_untemplated.clone());
+                if let StatementInputKind::Parsed(statement) = &statement_input.statement {
+                    lint_statements.push(LintStatement {
+                        statement: statement.as_ref(),
+                        statement_index: lint_statement_indices.len(),
+                        statement_range: statement_input.source_range.clone(),
+                    });
+                    lint_statement_indices.push(offset);
+                    source_statement_ranges.push(statement_input.source_range_untemplated.clone());
+                }
+            }
+            if lint_statements.is_empty() {
+                start = end;
+                continue;
             }
 
             let parser_fallback_used = statements[start..end]
@@ -442,8 +607,9 @@ impl<'a> Analyzer<'a> {
             let mut lint_issues = linter.check_document(&document);
             for issue in &mut lint_issues {
                 if let Some(local_index) = issue.statement_index {
-                    issue.statement_index =
-                        (start + local_index < end).then_some(start + local_index);
+                    issue.statement_index = lint_statement_indices
+                        .get(local_index)
+                        .map(|offset| start + offset);
                 }
                 if issue.source_name.is_none() {
                     issue.source_name = source_name_key.map(str::to_owned);
@@ -500,10 +666,11 @@ impl<'a> Analyzer<'a> {
         }
 
         for (index, stmt_input) in statements.iter().enumerate() {
-            match &stmt_input.statement {
-                Statement::CreateTable(create) => {
-                    self.precollect_create_table(create, index);
-                }
+            let StatementInputKind::Parsed(statement) = &stmt_input.statement else {
+                continue;
+            };
+            match statement.as_ref() {
+                Statement::CreateTable(create) => self.precollect_create_table(create, index),
                 Statement::CreateView(CreateView { name, .. }) => {
                     self.precollect_create_view(name);
                 }
@@ -536,7 +703,10 @@ impl<'a> Analyzer<'a> {
         let mut first_source: HashMap<String, String> = HashMap::new();
 
         for (index, stmt_input) in statements.iter().enumerate() {
-            let Statement::Query(_) = &stmt_input.statement else {
+            let StatementInputKind::Parsed(statement) = &stmt_input.statement else {
+                continue;
+            };
+            let Statement::Query(_) = statement.as_ref() else {
                 continue;
             };
 
