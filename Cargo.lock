@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "flowscope-cli"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "flowscope-core"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "chrono",
  "flowscope-sqlparser",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "flowscope-export"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "chrono",
  "csv",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "flowscope-sqlparser"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "bigdecimal",
  "log",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "flowscope-wasm"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "chrono",
  "console_error_panic_hook",

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-02
+
 ### Added
 
 - Added synthetic regressions for MSSQL `CREATE OR ALTER VIEW`, multiple Synapse `OPENROWSET` sources, `DELTA` format, and CSV `ROWSET_OPTIONS`.
