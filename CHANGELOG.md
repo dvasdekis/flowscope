@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-02
+
+### Fixed
+
+- Raised the request-wide MSSQL expanded statement-range budget to 100,000 while retaining the 1,000-repeat limit for each `GO` separator.
+- Fixed portable core release checksums to use flat asset basenames and verify the emitted checksum.
+
 ## [0.9.6] - 2026-10-02
 
 ### Added

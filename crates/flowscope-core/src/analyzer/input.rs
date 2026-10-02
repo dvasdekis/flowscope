@@ -1167,11 +1167,18 @@ pub(crate) struct StatementInput<'a> {
 pub(crate) fn collect_statements<'a>(
     request: &'a AnalyzeRequest,
 ) -> (Vec<StatementInput<'a>>, Vec<Issue>) {
+    collect_statements_with_mssql_range_limit(request, MAX_MSSQL_EXPANDED_STATEMENT_RANGES)
+}
+
+fn collect_statements_with_mssql_range_limit<'a>(
+    request: &'a AnalyzeRequest,
+    mssql_range_limit: usize,
+) -> (Vec<StatementInput<'a>>, Vec<Issue>) {
     let mut issues = Vec::new();
     let mut statements = Vec::new();
-    // Share the repeat budget across every source in the request so separate files
-    // cannot each consume the full expansion allowance.
-    let mut remaining_mssql_ranges = MAX_MSSQL_GO_REPEAT;
+    // Share the expanded-range budget across every source so files and inline SQL
+    // cannot each consume the full allowance independently.
+    let mut remaining_mssql_ranges = mssql_range_limit;
 
     let has_sql = !request.sql.trim().is_empty();
     let has_files = request
@@ -3857,18 +3864,107 @@ mod tests {
         request.files = Some(vec![
             FileSource {
                 name: "first.sql".to_string(),
-                content: format!("SELECT 1;\nGO {}\n", MAX_MSSQL_GO_REPEAT),
+                content: "SELECT 1;\nSELECT 2;".to_string(),
             },
             FileSource {
                 name: "second.sql".to_string(),
+                content: "SELECT 3;".to_string(),
+            },
+        ]);
+        request.sql = "SELECT 4;\nSELECT 5;".to_string();
+        request.source_name = Some("inline.sql".to_string());
+
+        let (statements, issues) = collect_statements_with_mssql_range_limit(&request, 5);
+        assert!(
+            issues.is_empty(),
+            "exactly reaching the shared range limit should succeed: {issues:?}"
+        );
+        assert_eq!(statements.len(), 5);
+
+        let (statements, issues) = collect_statements_with_mssql_range_limit(&request, 4);
+        assert_eq!(statements.len(), 3);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::INVALID_REQUEST);
+        assert_eq!(issues[0].source_name.as_deref(), Some("inline.sql"));
+    }
+
+    #[test]
+    fn mssql_accepts_more_than_one_thousand_ordinary_statements_across_files() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        let first_file_count = 600;
+        let second_file_count = 600;
+        request.files = Some(vec![
+            FileSource {
+                name: "first.sql".to_string(),
+                content: (0..first_file_count)
+                    .map(|index| format!("SELECT {index};\n"))
+                    .collect(),
+            },
+            FileSource {
+                name: "second.sql".to_string(),
+                content: (first_file_count..first_file_count + second_file_count)
+                    .map(|index| format!("SELECT {index};\n"))
+                    .collect(),
+            },
+        ]);
+
+        let (statements, issues) = collect_statements(&request);
+        assert!(
+            issues.is_empty(),
+            "ordinary MSSQL statements should fit within the expanded-range limit: {issues:?}"
+        );
+        assert_eq!(statements.len(), first_file_count + second_file_count);
+        for (index, statement) in statements.iter().enumerate() {
+            let expected_source = if index < first_file_count {
+                "first.sql"
+            } else {
+                "second.sql"
+            };
+            assert_eq!(
+                statement.source_name.as_deref().map(String::as_str),
+                Some(expected_source)
+            );
+            assert_eq!(
+                &statement.source_sql[statement.source_range.clone()],
+                format!("SELECT {index}")
+            );
+        }
+    }
+
+    #[test]
+    fn mssql_go_1000_followed_by_ordinary_sql_fits_expanded_range_limit() {
+        let mut request = base_request();
+        request.dialect = Dialect::Mssql;
+        request.files = Some(vec![
+            FileSource {
+                name: "repeated.sql".to_string(),
+                content: "SELECT 1;\nGO 1000\n".to_string(),
+            },
+            FileSource {
+                name: "following.sql".to_string(),
                 content: "SELECT 2;".to_string(),
             },
         ]);
+
         let (statements, issues) = collect_statements(&request);
-        assert_eq!(statements.len(), MAX_MSSQL_GO_REPEAT);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].code, issue_codes::INVALID_REQUEST);
-        assert_eq!(issues[0].source_name.as_deref(), Some("second.sql"));
+        assert!(
+            issues.is_empty(),
+            "GO 1000 plus a following statement should fit the range budget: {issues:?}"
+        );
+        assert_eq!(statements.len(), MAX_MSSQL_GO_REPEAT + 1);
+        assert!(statements[..MAX_MSSQL_GO_REPEAT].iter().all(|statement| {
+            statement.source_name.as_deref().map(String::as_str) == Some("repeated.sql")
+        }));
+        let final_statement = statements.last().expect("following statement");
+        assert_eq!(
+            final_statement.source_name.as_deref().map(String::as_str),
+            Some("following.sql")
+        );
+        assert_eq!(
+            &final_statement.source_sql[final_statement.source_range.clone()],
+            "SELECT 2"
+        );
     }
 
     #[test]
@@ -4017,10 +4113,16 @@ mod tests {
             assert_eq!(ranges.len(), 2, "invalid GO suffix split a batch: {suffix}");
             assert!(sql[ranges[1].clone()].contains("GO"));
         }
-        for suffix in ["1001", "18446744073709551616"] {
+        for suffix in ["18446744073709551616"] {
             let sql = format!("SELECT 1;\nGO {suffix}\nSELECT 2;");
             assert!(compute_statement_ranges_for_dialect(&sql, Dialect::Mssql).is_err());
         }
+    }
+
+    #[test]
+    fn mssql_go_repeat_above_per_separator_limit_is_rejected() {
+        let sql = format!("SELECT 1;\nGO {}\nSELECT 2;", MAX_MSSQL_GO_REPEAT + 1);
+        assert!(compute_statement_ranges_for_dialect(&sql, Dialect::Mssql).is_err());
     }
 
     #[test]

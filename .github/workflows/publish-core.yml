@@ -484,8 +484,10 @@ jobs:
       - name: Generate package checksum
         run: |
           set -euo pipefail
-          sha256sum "release-assets/flowscope-core-${GITHUB_REF_NAME}.tgz" \
-            > "release-assets/flowscope-core-${GITHUB_REF_NAME}-SHA256SUMS"
+          cd release-assets
+          sha256sum "flowscope-core-${GITHUB_REF_NAME}.tgz" \
+            > "flowscope-core-${GITHUB_REF_NAME}-SHA256SUMS"
+          sha256sum -c "flowscope-core-${GITHUB_REF_NAME}-SHA256SUMS"
 
       - name: Upload core package assets
         env:

@@ -69,6 +69,29 @@ const harness = `<!doctype html>
         sql: goSql,
         dialect: 'mssql',
       })));
+      const aggregateResult = JSON.parse(analyze_sql_json(JSON.stringify({
+        sql: 'SELECT 3;',
+        sourceName: 'inline.sql',
+        dialect: 'mssql',
+        files: [
+          { name: 'first.sql', content: 'SELECT 1;\\n'.repeat(501) },
+          { name: 'second.sql', content: 'SELECT 2;\\n'.repeat(501) },
+        ],
+      })));
+      if (
+        aggregateResult.summary.issueCount.errors !== 0 ||
+        aggregateResult.summary.statementCount !== 1003 ||
+        aggregateResult.statements.length !== 1003 ||
+        !aggregateResult.statements.slice(0, 501).every(
+          (statement) => statement.sourceName === 'first.sql'
+        ) ||
+        !aggregateResult.statements.slice(501, 1002).every(
+          (statement) => statement.sourceName === 'second.sql'
+        ) ||
+        aggregateResult.statements[1002].sourceName !== 'inline.sql'
+      ) {
+        throw new Error('MSSQL aggregate range budget truncated a valid multi-file request');
+      }
       const moduleSql = "CREATE OR ALTER PROC dbo.copy_rows @source_id INT = 7 OUTPUT, @rows dbo.RowList READONLY AS BEGIN SELECT N'CREATE PROC hidden @x INT OUTPUT'; END";
       const moduleResult = analyzeMssql(moduleSql);
       const malformedModuleResult = analyzeMssql(
@@ -332,6 +355,7 @@ const harness = `<!doctype html>
         statementCount: result.summary.statementCount,
         tableLabels,
         mssqlStatementCount: mssqlResult.summary.statementCount,
+        aggregateMssqlStatementCount: aggregateResult.summary.statementCount,
         moduleStatementType: moduleResult.statements[0].statementType,
         synapseStatementCount: synapseResult.summary.statementCount,
         metadataStatementType: metadataResult.statements[0].statementType,
