@@ -235,9 +235,22 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     let qualifier = name.to_string();
                     // SelectItemQualifiedWildcardKind::Display appends ".*"
                     let qualifier = qualifier.strip_suffix(".*").unwrap_or(&qualifier);
+                    let external_alias = match name {
+                        ast::SelectItemQualifiedWildcardKind::ObjectName(object_name) => {
+                            match object_name.0.as_slice() {
+                                [ast::ObjectNamePart::Identifier(ident)]
+                                    if self.ctx.external_rowset_columns(&ident.value).is_some() =>
+                                {
+                                    Some(ident.value.as_str())
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
                     self.analyzer.expand_wildcard(
                         self.ctx,
-                        Some(qualifier),
+                        Some(external_alias.unwrap_or(qualifier)),
                         self.target_node.as_deref(),
                     );
                 }

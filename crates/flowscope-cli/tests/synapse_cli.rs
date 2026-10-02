@@ -249,6 +249,48 @@ fn cli_preserves_nonreserved_keyword_expression_forms() {
 }
 
 #[test]
+fn cli_preserves_quoted_openrowset_alias_types_without_source_lineage() {
+    for (alias, reference) in [("[r]", "[R]"), ("\"r\"", "\"R\""), ("r", "[R]")] {
+        for projection in [format!("{reference}.id"), format!("{reference}.*")] {
+            let sql = format!(
+                "SELECT {projection} FROM OPENROWSET(BULK 'demo.parquet', FORMAT = 'PARQUET') \
+                 WITH (id INT) AS {alias}"
+            );
+            let result = analyze_mssql(&sql);
+            assert!(!has_issue(&result, "PARSE_ERROR"), "{sql}");
+            assert!(!has_issue(&result, "UNKNOWN_COLUMN"), "{sql}");
+            assert!(has_warning(&result, "UNSUPPORTED_SYNTAX"), "{sql}");
+            let columns: Vec<_> = result["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|node| node["type"] == "column")
+                .collect();
+            assert_eq!(columns.len(), 1, "{sql}");
+            assert_eq!(columns[0]["label"], "id", "{sql}");
+            assert_eq!(columns[0]["metadata"]["data_type"], "INTEGER", "{sql}");
+            assert!(
+                result["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|node| node["type"] != "table" && node["qualifiedName"].is_null()),
+                "{sql}"
+            );
+            assert!(
+                result["edges"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|edge| edge["type"] != "data_flow"),
+                "{sql}"
+            );
+            assert!(result["resolvedSchema"].is_null(), "{sql}");
+        }
+    }
+}
+
+#[test]
 fn cli_accepts_right_nested_mssql_joins_with_deferred_conditions() {
     for join_type in ["INNER", "LEFT", "RIGHT", "FULL"] {
         let sql = format!(

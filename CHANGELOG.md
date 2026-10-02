@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Resolved bracketed and double-quoted Synapse OPENROWSET aliases consistently in column references, wildcards, and lexical shadowing, preserving declared output types without fabricating source lineage or implied schema tables.
 - Parsed MSSQL right-nested joins with deferred `ON` clauses while preserving join grouping, predicate ownership, recursion limits, and outer-join semantics.
 - Accepted the owner-confirmed Serverless SQL pool trailing comma after a complete `CREATE TABLE` column list, including temporary tables inside procedures, without relaxing function arguments or other comma-separated lists.
 - Configured release WASM builds to use size-oriented optimization so standard build and CI output stay within the existing 9 MiB budget.

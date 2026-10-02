@@ -107,6 +107,18 @@ const harness = `<!doctype html>
       const bulkFileListResult = analyzeMssql(
         "SELECT src.id FROM OPENROWSET(BULK ('data/a.parquet', 'data/b.parquet'), FORMAT = 'PARQUET') WITH (id INT) AS src"
       );
+      const quotedAliasResults = [
+        ['[r]', '[R]'],
+        ['"r"', '"R"'],
+        ['r', '[R]'],
+      ].flatMap(([alias, reference]) =>
+        [reference + '.id', reference + '.*'].map((projection) =>
+          analyzeMssql(
+            "SELECT " + projection +
+            " FROM OPENROWSET(BULK 'demo.parquet', FORMAT = 'PARQUET') WITH (id INT) AS " + alias
+          )
+        )
+      );
       const malformedBulkFileListResult = analyzeMssql(
         "SELECT src.id FROM OPENROWSET(BULK ('data/a.parquet',), FORMAT = 'PARQUET') WITH (id INT) AS src"
       );
@@ -269,6 +281,19 @@ const harness = `<!doctype html>
       if (!isOpenrowset(bulkFileListResult)) {
         throw new Error('Synapse BULK file list analysis failed: ' + JSON.stringify(bulkFileListResult.issues));
       }
+      if (!quotedAliasResults.every((rowset) =>
+        isOpenrowset(rowset) &&
+        !hasIssue(rowset, 'UNKNOWN_COLUMN') &&
+        rowset.nodes.filter((node) => node.type === 'column').length === 1 &&
+        rowset.nodes.some((node) =>
+          node.type === 'column' && node.label === 'id' && node.metadata?.data_type === 'INTEGER'
+        ) &&
+        rowset.nodes.every((node) => !node.qualifiedName) &&
+        rowset.edges.every((edge) => edge.type !== 'data_flow') &&
+        !(rowset.resolvedSchema?.tables.length)
+      )) {
+        throw new Error('Quoted OPENROWSET alias types or external-lineage boundary failed');
+      }
       if (inlineTvfResult.statements.length !== 1 ||
           inlineTvfResult.statements[0].span.end !== inlineTvfSql.length ||
           hasIssue(inlineTvfResult, 'PARSE_ERROR')) {
@@ -313,6 +338,7 @@ const harness = `<!doctype html>
         bareIfMetadataType: bareMetadataResult.statements[0].statementType,
         openrowsetOptionOrders: 2,
         bulkFileList: true,
+        quotedRowsetAliases: quotedAliasResults.length,
         inlineTvfCteWithoutFinalSemicolon: true,
         cetasOutputNameList: true,
         bulkLexicalBoundaries: bulkBoundaryResults.length,

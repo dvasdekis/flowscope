@@ -429,7 +429,7 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
             })
             .collect();
         self.ctx
-            .register_external_rowset_in_scope(alias.name.to_string(), columns);
+            .register_external_rowset_in_scope(alias.name.value.clone(), columns);
     }
 
     pub fn resolve_table_alias(&self, alias: Option<&str>) -> Option<String> {

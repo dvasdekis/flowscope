@@ -786,6 +786,127 @@ fn synapse_openrowset_declared_schema_expands_alias_wildcard_without_external_li
 }
 
 #[test]
+fn synapse_openrowset_quoted_alias_preserves_types_without_external_lineage() {
+    for (alias, reference) in [
+        ("r", "r"),
+        ("[r]", "[r]"),
+        ("\"r\"", "\"r\""),
+        ("[R]", "r"),
+        ("r", "[R]"),
+        ("[row set]", "[row set]"),
+        ("[row.set]", "[row.set]"),
+        ("[[r]]]", "[[r]]]"),
+    ] {
+        for projection in [
+            format!("{reference}.id, {reference}.customer_name"),
+            format!("{reference}.*"),
+            "*".to_string(),
+        ] {
+            let sql = format!(
+                "SELECT {projection} FROM OPENROWSET(BULK 'demo.parquet', FORMAT = 'PARQUET') \
+                 WITH (id INT, customer_name VARCHAR(32)) AS {alias}"
+            );
+            let mut request = make_request(&sql);
+            request.dialect = Dialect::Mssql;
+            let result = analyze(&request);
+
+            assert_eq!(result.statements.len(), 1, "{sql}");
+            assert!(
+                !result.issues.iter().any(|issue| {
+                    issue.code == issue_codes::PARSE_ERROR
+                        || issue.code == issue_codes::UNKNOWN_COLUMN
+                        || issue.code == issue_codes::UNRESOLVED_REFERENCE
+                }),
+                "{sql}: {:?}",
+                result.issues
+            );
+            assert!(
+                result.issues.iter().any(|issue| {
+                    issue.code == issue_codes::UNSUPPORTED_SYNTAX
+                        && issue
+                            .message
+                            .contains("external-file lineage is not modeled")
+                }),
+                "{sql}"
+            );
+            assert!(
+                result.nodes_in_statement(0).all(|node| {
+                    node.node_type != NodeType::Table && node.qualified_name.is_none()
+                }),
+                "{sql}: {:?}",
+                result.nodes
+            );
+            assert!(
+                result
+                    .edges_in_statement(0)
+                    .all(|edge| { edge.edge_type != EdgeType::DataFlow }),
+                "{sql}"
+            );
+            assert!(
+                result
+                    .resolved_schema
+                    .as_ref()
+                    .is_none_or(|schema| { schema.tables.is_empty() }),
+                "{sql}"
+            );
+
+            let columns: Vec<_> = result
+                .nodes_in_statement(0)
+                .filter(|node| node.node_type == NodeType::Column)
+                .collect();
+            assert_eq!(columns.len(), 2, "{sql}: {columns:?}");
+            for (name, data_type) in [("id", "INTEGER"), ("customer_name", "VARCHAR(32)")] {
+                let column = columns
+                    .iter()
+                    .find(|column| column.label.as_ref() == name)
+                    .unwrap_or_else(|| panic!("{sql}: missing {name}"));
+                assert_eq!(
+                    column
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("data_type"))
+                        .and_then(|value| value.as_str()),
+                    Some(data_type),
+                    "{sql}: {name}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn synapse_openrowset_quoted_alias_reports_unknown_column_without_external_lineage() {
+    for alias in ["[r]", "\"r\""] {
+        let sql = format!(
+            "SELECT {alias}.id FROM OPENROWSET(BULK 'demo.parquet', FORMAT = 'PARQUET') \
+             WITH (id INT) AS {alias} WHERE {alias}.missing_column > 0"
+        );
+        let mut request = make_request(&sql);
+        request.dialect = Dialect::Mssql;
+        let result = analyze(&request);
+        assert!(!result
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::PARSE_ERROR));
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.code == issue_codes::UNKNOWN_COLUMN
+                    && issue.message.contains("external OPENROWSET alias 'r'")
+            }),
+            "{sql}: {:?}",
+            result.issues
+        );
+        assert!(result
+            .edges_in_statement(0)
+            .all(|edge| edge.edge_type != EdgeType::DataFlow));
+        assert!(result
+            .resolved_schema
+            .as_ref()
+            .is_none_or(|schema| schema.tables.is_empty()));
+    }
+}
+
+#[test]
 fn synapse_openrowset_declared_schema_reports_unknown_qualified_columns() {
     let sql = concat!(
         "SELECT src.order_id FROM OPENROWSET(",

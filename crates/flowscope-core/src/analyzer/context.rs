@@ -1,4 +1,4 @@
-use super::helpers::generate_output_node_id;
+use super::helpers::{generate_output_node_id, unquote_identifier};
 use crate::types::{Edge, FilterClauseType, FilterPredicate, JoinType, Node, NodeType, Span};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -705,15 +705,18 @@ impl StatementContext {
             let shadowed = scope
                 .aliases
                 .keys()
-                .any(|candidate| candidate.eq_ignore_ascii_case(alias))
-                || scope
-                    .subquery_aliases
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(alias))
+                .any(|candidate| unquote_identifier(candidate).eq_ignore_ascii_case(alias))
+                || scope.subquery_aliases.iter().any(|candidate| {
+                    if scope.external_rowset_columns.contains_key(candidate) {
+                        candidate.eq_ignore_ascii_case(alias)
+                    } else {
+                        unquote_identifier(candidate).eq_ignore_ascii_case(alias)
+                    }
+                })
                 || scope
                     .alias_instances
                     .keys()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(alias));
+                    .any(|candidate| unquote_identifier(candidate).eq_ignore_ascii_case(alias));
             if shadowed {
                 return None;
             }
@@ -872,5 +875,51 @@ mod external_rowset_scope_tests {
 
         assert!(ctx.external_rowset_columns("foo").is_none());
         assert!(!ctx.subquery_aliases.contains("foo"));
+    }
+
+    #[test]
+    fn quoted_inner_aliases_shadow_outer_external_rowsets() {
+        for alias in ["r", "[R]", "\"R\""] {
+            for kind in ["table", "subquery", "instance"] {
+                let mut ctx = StatementContext::new(0);
+                ctx.push_scope();
+                ctx.register_external_rowset_in_scope("r".to_string(), Vec::new());
+                ctx.push_scope();
+                match kind {
+                    "table" => {
+                        ctx.register_alias_in_scope(alias.to_string(), "synthetic".to_string())
+                    }
+                    "subquery" => ctx.register_subquery_alias_in_scope(alias.to_string()),
+                    "instance" => ctx.register_alias_instance(
+                        alias.to_string(),
+                        "synthetic".to_string(),
+                        std::sync::Arc::from("synthetic_node"),
+                    ),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    ctx.external_rowset_columns("r").is_none(),
+                    "{kind}: {alias}"
+                );
+                ctx.pop_scope();
+                assert!(
+                    ctx.external_rowset_columns("r").is_some(),
+                    "{kind}: {alias}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn external_alias_values_with_literal_delimiters_remain_distinct() {
+        let mut ctx = StatementContext::new(0);
+        ctx.push_scope();
+        ctx.register_external_rowset_in_scope("r".to_string(), Vec::new());
+        ctx.push_scope();
+        ctx.register_external_rowset_in_scope("[r]".to_string(), Vec::new());
+        assert!(ctx.external_rowset_columns("r").is_some());
+        assert!(ctx.external_rowset_columns("[r]").is_some());
+        ctx.pop_scope();
+        assert!(ctx.external_rowset_columns("[r]").is_none());
     }
 }
